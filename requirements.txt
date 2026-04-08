@@ -1,0 +1,38 @@
+# ============================================================
+# Chati — VRChat AI Agent Dependencies
+# Install: pip install -r requirements.txt
+# ============================================================
+
+# --- Model Client (talks to Ollama server via OpenAI-compatible API) ---
+openai>=1.30.0
+
+# --- VRChat OSC Communication ---
+python-osc>=1.8.3
+
+# --- Text-to-Speech ---
+piper-tts>=1.2.0
+
+# --- Audio I/O ---
+# sounddevice: TTS output routing to VB-Audio Cable
+# PyAudioWPatch: WASAPI loopback capture for VRChat audio
+sounddevice>=0.4.6
+PyAudioWPatch>=0.2.12
+
+# --- Speech-to-Text (Whisper, runs on GPU) ---
+faster-whisper>=1.0.0
+
+# --- Audio/Video Processing ---
+numpy>=1.24.0
+
+# --- Screen Capture (replaces OBS Virtual Camera) ---
+mss>=10.0.0
+
+# --- Image Processing ---
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# --- Configuration ---
+PyYAML>=6.0
+
+# --- Async HTTP (for agent controller) ---
+aiohttp>=3.9.0

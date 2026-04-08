@@ -1,0 +1,46 @@
+# ============================================================
+# Chati — VRChat AI Agent
+# ============================================================
+
+# --- Environment & Secrets ---
+.env
+.env.*
+*.pem
+*.key
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+
+# --- Models (large binary files — download separately) ---
+models/piper/*.onnx
+models/piper/*.onnx.json
+
+# --- Database (agent memory — generated at runtime) ---
+agent_memory.db
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS ---
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# --- Test artifacts ---
+test_*.jpg
+cam_*.jpg
+screen_capture.jpg
+
+# --- Logs ---
+*.log

@@ -1,0 +1,34 @@
+# ============================================================
+# Ollama Server Configuration for Chati (Gemma 4 E2B)
+# Run inside WSL2: ollama serve
+# ============================================================
+
+model:
+  # Ollama model tag — Gemma 4 E2B instruction-tuned (multimodal)
+  id: "gemma4:e2b"
+
+server:
+  # Host — Ollama binds to localhost by default
+  # Set OLLAMA_HOST=0.0.0.0 to expose to other machines
+  host: "127.0.0.1"
+  # Port — Ollama default (OpenAI-compatible API at /v1/)
+  port: 11434
+
+gpu:
+  # Ollama auto-manages VRAM; these are reference values
+  memory_utilization: 0.85
+  # Context window — 8K is enough for agent interactions
+  max_model_len: 8192
+
+sampling:
+  # Gemma 4 recommended sampling parameters
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 64
+
+multimodal:
+  # Vision settings (used by environment_query tool)
+  visual_token_budget: 140
+  max_frames: 2
+  # Audio — handled by faster-whisper STT, not the model
+  audio_enabled: false
