@@ -1,54 +1,54 @@
 # Chati — VRChat AI Agent
 
-A local, real-time AI companion for VRChat powered by **Gemma 4 E2B** (multimodal) served via **Ollama**, with **faster-whisper** for speech recognition and **Piper TTS** for voice output.
+A local, real-time AI companion for VRChat with **real-time computer vision** (YOLO11 + OCR), **speech recognition** (Whisper), and **multimodal reasoning** (Gemma 4 E2B) — all running locally on a single RTX 3090.
 
-Chati can see, hear, speak, move, gesture, remember, and explore VRChat worlds — all running locally on your RTX 3090.
+Chati can see players in real-time, read chatbox messages, hear speech, speak back, move, gesture, remember facts, and explore VRChat worlds autonomously.
+
+> For the full technical deep-dive, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Architecture
 
 ```
-+-------------------------------------------------------------+
-|  Windows 11 (Native Python)                                  |
-|                                                              |
-|  +----------+  +-------------+  +------------------------+  |
-|  |  Screen   |  |  Audio      |  |  Agent Controller      |  |
-|  |  Capture  |--| Capture     |--|  (Main Loop)            |  |
-|  |  (mss)    |  |(pyaudio     |  |                        |  |
-|  |           |  | +whisper)   |  |  Explore / Social mode  |  |
-|  +----------+  +-------------+  +-----------+------------+  |
-|                                              |               |
-|                                  +-----------+----------+   |
-|                                  |  MCP Tools            |   |
-|                                  |  speak, move, gesture |   |
-|                                  |  look, memory, world  |   |
-|                                  |  chatbox, environment |   |
-|                                  +-----------+----------+   |
-|                                              |               |
-|                    +---------------+         |               |
-|                    | Piper TTS     |---------+               |
-|                    | -> VB-Cable   |                         |
-|                    +---------------+                         |
-|                            |                                 |
-|                       VRChat (OSC) <-------------------------+
-+----------------------------+---------------------------------+
-                             | HTTP :11434
-+----------------------------+---------------------------------+
-|  WSL2 (Ubuntu)             |                                 |
-|  +-------------------------+---------------------------+     |
-|  |  Ollama Server                                       |     |
-|  |  Gemma 4 E2B (multimodal, Q4 quantized)             |     |
-|  |  OpenAI-compatible API at /v1/                       |     |
-|  +------------------------------------------------------+     |
-+---------------------------------------------------------------+
++================================================================+
+|  PERCEPTION LAYER (background threads, GPU)                     |
+|                                                                 |
+|  Screen Capture -----> YOLO11 nano -----> player count,         |
+|  (mss, 1 FPS)         (~5ms/frame)       positions, objects     |
+|                   +--> EasyOCR ---------> chatbox text           |
+|                   +--> Frame Diff ------> scene changes          |
+|                                                                 |
+|  Audio Capture -----> Whisper STT ------> speech transcription   |
+|  (WASAPI loopback)    (faster-whisper)                          |
++================================================================+
+              |                              |
+              v                              v
++================================================================+
+|  STATE MACHINE           |  REASONING (Gemma 4 via Ollama)      |
+|                          |                                      |
+|  IDLE -> EXPLORING       |  Only called for decisions:          |
+|       -> APPROACHING     |  "What should I do next?"            |
+|       -> SOCIALIZING     |  "Player said X, respond."           |
+|       -> CONVERSING      |  NOT used for perception.            |
++================================================================+
+              |
+              v
++================================================================+
+|  ACTION LAYER (MCP Tools -> VRChat OSC)                         |
+|                                                                 |
+|  speak (Piper TTS)  |  move/look/jump  |  chatbox  |  gesture  |
+|  memory read/write   |  join_world      |  environment_query    |
++================================================================+
 ```
+
+> See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical deep-dive including VRAM budget, state transitions, and technology choice rationale.
 
 ## How It Works
 
-1. **Vision**: Captures your primary monitor via screen capture (mss) — sees whatever VRChat shows
-2. **Hearing**: Captures VRChat audio via WASAPI loopback on a virtual cable, transcribes speech with faster-whisper (Whisper STT running on GPU)
-3. **Thinking**: Sends vision + transcribed speech to Gemma 4 E2B via Ollama for reasoning and decision-making
-4. **Acting**: Uses MCP tools to speak (Piper TTS), move, gesture, look around, send chatbox messages, remember things, and join worlds — all via VRChat OSC
-5. **Behavior**: Two modes — **Explore** (roam, look around, comment on the world) and **Social** (stop, greet players, read chatbox text, have conversations)
+1. **Real-Time Vision** (YOLO11 + OCR): Continuously scans the screen at 1 FPS. YOLO detects players and objects in ~5ms. EasyOCR reads chatbox text above players' heads. Frame differencing detects scene changes. No LLM needed for perception.
+2. **Hearing** (Whisper STT): Captures VRChat audio via WASAPI loopback, detects speech start/end, transcribes with faster-whisper on GPU.
+3. **State Machine**: Drives behavior based on perception — EXPLORING when alone, APPROACHING when spotting a player, SOCIALIZING after greeting, CONVERSING when speech is detected. No random decisions.
+4. **Reasoning** (Gemma 4): Only called for high-level decisions: "What should I do?" or "Player said X, respond." Gets perception data + video frame + speech, returns tool calls.
+5. **Acting** (MCP Tools): Executes tool calls via VRChat OSC — move, gesture, chatbox, TTS speech, memory, world joins.
 
 ## Requirements
 
@@ -175,33 +175,36 @@ When a player speaks near Chati (audio routed via virtual cable):
 ## Project Structure
 ```
 chati-project/
-+-- model_server/        # Ollama server config (runs in WSL2)
-|   +-- config.yaml      # Server parameters
-|   +-- server.py        # Server launcher
-|   +-- setup_wsl.sh     # WSL2 setup script
-+-- mcp_tools/           # AI agent capabilities
-|   +-- speak.py         # Text-to-speech via Piper
-|   +-- gesture.py       # Avatar emotes/expressions
-|   +-- move.py          # Avatar locomotion
-|   +-- look.py          # Head/eye direction
-|   +-- memory.py        # Long-term memory (SQLite)
-|   +-- environment.py   # Visual scene analysis
-|   +-- chatbox.py       # VRChat chatbox messages
-|   +-- world.py         # Join VRChat worlds
-+-- vrchat_bridge/       # VRChat communication
-|   +-- osc_client.py    # OSC send/receive
-|   +-- tts_output.py    # Audio -> VB-Cable routing
-+-- perception/          # Sensory input
-|   +-- audio_capture.py # WASAPI loopback + Whisper STT
-|   +-- video_capture.py # Screen capture (mss)
-+-- agent/               # AI brain
-|   +-- controller.py    # Main loop (perception->reasoning->action)
-|   +-- personality.json # Character definition (Chati)
-|   +-- prompts.py       # System prompt builder
-+-- models/piper/        # Piper TTS voice models (download separately)
-+-- requirements.txt     # Python dependencies
-+-- api.md              # MCP tool API documentation
-+-- README.md           # This file
++-- agent/                  # AI brain
+|   +-- controller.py       # Main loop (perception -> state -> reasoning -> action)
+|   +-- state_machine.py    # Behavioral states (EXPLORING, SOCIALIZING, etc.)
+|   +-- personality.json    # Chati's character definition
+|   +-- prompts.py          # System prompt builder for Gemma 4
++-- perception/             # Sensory input (real-time, background threads)
+|   +-- scene_analyzer.py   # YOLO11 + EasyOCR + frame diff -> PerceptionState
+|   +-- video_capture.py    # Screen capture via mss
+|   +-- audio_capture.py    # WASAPI loopback + Whisper STT
++-- mcp_tools/              # AI agent capabilities (tool calls)
+|   +-- speak.py            # Piper TTS voice output
+|   +-- gesture.py          # Avatar emotes (wave, dance, etc.)
+|   +-- move.py             # Avatar locomotion
+|   +-- look.py             # Head/eye direction
+|   +-- memory.py           # Long-term memory (SQLite)
+|   +-- environment.py      # Gemma 4 deep scene analysis (legacy)
+|   +-- chatbox.py          # VRChat chatbox messages
+|   +-- world.py            # Join VRChat worlds via deep link
++-- vrchat_bridge/          # VRChat communication
+|   +-- osc_client.py       # OSC send/receive (UDP)
+|   +-- tts_output.py       # Audio output to VB-Cable
++-- model_server/           # Ollama server config (runs in WSL2)
+|   +-- config.yaml         # Server parameters
+|   +-- server.py           # Server launcher
+|   +-- setup_wsl.sh        # WSL2 setup automation
++-- models/piper/           # Piper TTS voice models (download separately)
++-- ARCHITECTURE.md         # Full technical architecture deep-dive
++-- api.md                  # MCP tool API reference
++-- requirements.txt        # Python dependencies
++-- README.md               # This file
 ```
 
 ## Troubleshooting

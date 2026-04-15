@@ -39,6 +39,8 @@ from mcp_tools.environment import EnvironmentTool
 from mcp_tools.chatbox import ChatboxTool
 from mcp_tools.world import WorldTool
 from agent.prompts import load_personality, build_system_prompt, build_tool_definitions
+from agent.state_machine import AgentStateMachine, AgentState
+from perception.scene_analyzer import SceneAnalyzer
 
 logger = logging.getLogger("agent.controller")
 
@@ -137,23 +139,23 @@ class AgentController:
         # Tool definitions in OpenAI format
         self._tool_definitions = build_tool_definitions(self._tool_schemas)
 
-        # Last time we did an environment check
-        self._last_env_check: float = 0.0
-        # Latest environment summary (human-readable)
-        self._environment_summary: Optional[str] = None
+        # --- New: Scene analyzer + State machine ---
+        self.scene_analyzer = SceneAnalyzer(self.video_capture)
+        self.state_machine = AgentStateMachine()
+
         # Flag to control the main loop
         self._running = False
-        # Idle behavior tracking
-        self._idle_ticks: int = 0
-        self._last_idle_action: float = 0.0
-        # How often idle actions happen (seconds)
-        self._idle_action_interval: float = 10.0
-        # Social mode tracking
-        self._greeted: bool = False
-        self._last_social_action: float = 0.0
-        # Recent actions log — tells the model what it already did
-        self._recent_actions: list[str] = []
-        self._max_recent_actions: int = 10
+        # Last time we called the LLM for a decision
+        self._last_llm_action: float = 0.0
+        # How often to call the LLM (seconds) — per state
+        self._action_intervals = {
+            AgentState.IDLE: 5.0,
+            AgentState.EXPLORING: 8.0,
+            AgentState.APPROACHING: 3.0,
+            AgentState.SOCIALIZING: 12.0,
+            AgentState.CONVERSING: 2.0,  # Fast response in conversation
+            AgentState.FOLLOWING: 5.0,
+        }
 
     def _collect_tool_schemas(self) -> list[dict]:
         """Collect all tool schemas from MCP tools.
@@ -200,8 +202,12 @@ class AgentController:
         logger.info("Starting video capture...")
         self.video_capture.start()
 
-        # Verify vLLM server is reachable
-        logger.info(f"Checking vLLM server at {self.model_url}...")
+        # Start real-time scene analyzer (YOLO + OCR)
+        logger.info("Starting scene analyzer (YOLO + OCR)...")
+        self.scene_analyzer.start()
+
+        # Verify Ollama server is reachable
+        logger.info(f"Checking Ollama server at {self.model_url}...")
         try:
             models = self.client.models.list()
             logger.info(f"vLLM server OK. Available models: {[m.id for m in models.data]}")
@@ -228,33 +234,51 @@ class AgentController:
             self.shutdown()
 
     async def _main_loop(self) -> None:
-        """Async main loop — perception → reasoning → action cycle."""
+        """Async main loop — perception → state → reasoning → action.
+
+        The scene analyzer runs continuously in a background thread.
+        This loop reads the perception state, updates the state machine,
+        and calls the LLM when appropriate for the current state.
+        """
         while self._running:
             try:
-                # --- Perception: Collect inputs ---
+                # --- 1. Read perception data ---
+                perception = self.scene_analyzer.get_state()
                 audio_chunks = self.audio_capture.get_all_chunks()
-                latest_frame = self.video_capture.get_latest_frame_b64()
-
-                # --- Check if we need an environment update ---
-                now = time.time()
-                if now - self._last_env_check > ENVIRONMENT_CHECK_INTERVAL:
-                    await self._update_environment()
-                    self._last_env_check = now
-
-                # --- Reasoning: Process audio if detected ---
+                speech = None
                 if audio_chunks:
-                    # Audio detected — someone is likely talking
-                    logger.info(f"* Audio detected: {len(audio_chunks)} chunk(s)")
-                    await self._process_interaction(audio_chunks, latest_frame)
-                else:
-                    # No audio — maybe do idle behavior
-                    await self._idle_tick()
+                    speech = " ".join(c["text"] for c in audio_chunks).strip()
+                    if speech:
+                        logger.info(f'* Heard: "{speech}"')
+
+                # --- 2. Update state machine ---
+                state = self.state_machine.update(
+                    players=perception.players_visible,
+                    speech=speech,
+                    scene_changed=perception.scene_changed,
+                    view_blocked=perception.view_blocked,
+                )
+
+                # --- 3. Log perception summary ---
+                summary = perception.summary()
+                if perception.scene_changed or speech:
+                    logger.info(f"[{state.name}] {summary}")
+
+                # --- 4. Act based on state ---
+                now = time.time()
+                interval = self._action_intervals.get(state, 8.0)
+
+                # Always act immediately for speech
+                if speech:
+                    await self._handle_conversation(speech, perception)
+                elif now - self._last_llm_action >= interval:
+                    self._last_llm_action = now
+                    await self._handle_state(state, perception)
 
             except Exception as e:
                 logger.error(f"Main loop error: {e}", exc_info=True)
 
-            # Heartbeat interval
-            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            await asyncio.sleep(1.0)  # 1s tick — perception runs separately
 
     async def _process_interaction(
         self,
@@ -309,11 +333,15 @@ class AgentController:
         # Build memory context from recent entries
         memory_ctx = self._get_memory_context()
 
+        # Build environment summary from real-time perception
+        perception = self.scene_analyzer.get_state()
+        env_summary = perception.for_prompt() if perception.timestamp > 0 else None
+
         # Build system prompt
         system_prompt = build_system_prompt(
             personality=self._personality,
             tools=self._tool_schemas,
-            environment_summary=self._environment_summary,
+            environment_summary=env_summary,
             memory_context=memory_ctx,
         )
 
@@ -333,8 +361,8 @@ class AgentController:
         logger.info(f"  Tools: {[t['function']['name'] for t in self._tool_definitions]}")
         if memory_ctx:
             logger.info(f"  Memory: {memory_ctx[:200]}")
-        if self._environment_summary:
-            logger.info(f"  Environment: {self._environment_summary[:200]}")
+        if env_summary:
+            logger.info(f"  Perception: {env_summary[:200]}")
         # Show user message content types
         if isinstance(user_message.get("content"), list):
             types = [p.get("type", "?") for p in user_message["content"]]
@@ -437,9 +465,10 @@ class AgentController:
 
             # Track what we did for anti-repetition
             action_summary = f"{func_name}({json.dumps(func_args, ensure_ascii=False)})"
-            self._recent_actions.append(action_summary)
-            if len(self._recent_actions) > self._max_recent_actions:
-                self._recent_actions = self._recent_actions[-self._max_recent_actions:]
+            self.state_machine.ctx.add_action(action_summary)
+            # Track chatbox messages separately for conversation anti-repetition
+            if func_name == "send_chatbox" and func_args.get("text"):
+                self.state_machine.ctx.add_chatbox(func_args["text"])
 
             # Add tool result to history for follow-up
             self._history.append({
@@ -451,184 +480,159 @@ class AgentController:
         except Exception as e:
             logger.error(f"Tool execution failed: {func_name} — {e}")
 
-    def _players_visible(self) -> int:
-        """Check how many players are visible from the latest environment data."""
-        if not self._environment_summary:
-            return 0
-        try:
-            data = json.loads(self._environment_summary)
-            # Handle nested JSON from Gemma's markdown responses
-            scene = data.get("scene", "")
-            if isinstance(scene, str) and scene.startswith("```"):
-                scene = scene.strip("`").strip()
-                if scene.startswith("json"):
-                    scene = scene[4:].strip()
-                data = json.loads(scene)
-            return int(data.get("players_visible", 0))
-        except (json.JSONDecodeError, ValueError, TypeError):
-            return 0
+    # ================================================================
+    # State-based action handlers
+    # ================================================================
 
-    async def _update_environment(self) -> None:
-        """Run a periodic environment awareness check."""
-        logger.info("~ Environment check...")
-        result = self.environment_tool.environment_query()
-        if result.get("success"):
-            self._environment_summary = json.dumps(result, indent=2)
-            players = self._players_visible()
-            logger.info(f"~ Environment ({players} players): {self._environment_summary[:250]}")
-        else:
-            logger.warning(f"~ Environment check failed: {result.get('error', '?')}")
-
-    async def _idle_tick(self) -> None:
-        """Handle idle behavior based on whether players are nearby.
-
-        Two modes:
-        - SOCIAL: Players visible → stop moving, face them, wave, talk
-        - EXPLORE: No players → navigate the world, look around, comment
-        """
-        self._idle_ticks += 1
-        now = time.time()
-
-        if now - self._last_idle_action < self._idle_action_interval:
-            return
-        self._last_idle_action = now
-
+    async def _handle_state(self, state: AgentState, perception) -> None:
+        """Dispatch to the appropriate handler based on agent state."""
+        ctx = self.state_machine.ctx
         frame_b64 = self.video_capture.get_latest_frame_b64()
         if not frame_b64:
             return
 
-        players = self._players_visible()
+        if state == AgentState.EXPLORING:
+            await self._act_explore(frame_b64, perception, ctx)
+        elif state == AgentState.APPROACHING:
+            await self._act_approach(frame_b64, perception, ctx)
+        elif state == AgentState.SOCIALIZING:
+            await self._act_socialize(frame_b64, perception, ctx)
+        elif state == AgentState.CONVERSING:
+            pass  # Handled by _handle_conversation
+        elif state == AgentState.IDLE:
+            await self._act_explore(frame_b64, perception, ctx)
 
-        if players > 0:
-            await self._social_tick(frame_b64, players)
-        else:
-            await self._explore_tick(frame_b64)
+    async def _handle_conversation(self, speech: str, perception) -> None:
+        """Handle a speech interaction — highest priority."""
+        frame_b64 = self.video_capture.get_latest_frame_b64()
+        ctx = self.state_machine.ctx
+        ctx.conversation_turns += 1
+        self._last_llm_action = time.time()
 
-    async def _social_tick(self, frame_b64: str, player_count: int) -> None:
-        """Player detected — stop everything and interact.
-
-        First encounter: wave and greet.
-        After greeting: observe, react to changes, wait for response.
-        """
-        # Stop any ongoing movement
+        # Stop moving to listen
         self.move_tool.move(direction="stop")
 
-        # Build recent actions context
-        actions_ctx = ""
-        if self._recent_actions:
-            actions_ctx = (
-                "\n\nYour recent actions (DO NOT repeat these):\n"
-                + "\n".join(f"- {a}" for a in self._recent_actions[-5:])
-            )
+        logger.info(f'[CONVERSING] Responding to: "{speech}"')
 
-        if not self._greeted:
-            # First time seeing a player — greet them
-            self._greeted = True
-            self._last_social_action = time.time()
-            logger.info(f"~ SOCIAL MODE: greeting {player_count} player(s)!")
+        content_parts = []
+        if frame_b64:
+            content_parts.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"},
+            })
 
-            greet_message = {
+        # Include perception data for context
+        perception_text = perception.for_prompt() if perception else ""
+
+        content_parts.append({
+            "type": "text",
+            "text": (
+                f'A player said to you: "{speech}"\n\n'
+                f"Scene info:\n{perception_text}\n\n"
+                "Respond naturally with send_chatbox. You can also "
+                "use gesture to react. Keep it conversational and short."
+                + ctx.recent_actions_text()
+                + ctx.recent_chatbox_text()
+            ),
+        })
+
+        await self._send_to_model({"role": "user", "content": content_parts})
+
+    async def _act_approach(self, frame_b64: str, perception, ctx) -> None:
+        """Approaching a player — move toward them and greet."""
+        if not ctx.greeted:
+            ctx.greeted = True
+            self.move_tool.move(direction="stop")
+
+            logger.info(f"[APPROACHING] Greeting {perception.players_visible} player(s)")
+
+            # Include chatbox text if OCR detected any
+            chatbox_info = ""
+            if perception.visible_text:
+                chatbox_info = (
+                    f'\nA player said (chatbox): "{" ".join(perception.visible_text)}"\n'
+                    "Respond to what they said!\n"
+                )
+
+            await self._send_to_model({
                 "role": "user",
                 "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"},
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            f"You just noticed {player_count} player(s) in VRChat! "
-                            "Greet them:\n"
-                            "1. Use gesture to wave\n"
-                            "2. Use send_chatbox with a SHORT friendly greeting "
-                            "(react to their avatar or the scene — be specific)\n\n"
-                            "IMPORTANT: Look for any TEXT floating above players' "
-                            "heads — that's their chatbox message to you. If you "
-                            "see text, READ it and RESPOND to what they said.\n\n"
-                            "Keep it to ONE chatbox message. Be natural and brief."
-                            + actions_ctx
-                        ),
-                    },
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"}},
+                    {"type": "text", "text": (
+                        f"You see {perception.players_visible} player(s) in VRChat!\n"
+                        f"Scene info:\n{perception.for_prompt()}\n"
+                        f"{chatbox_info}"
+                        "Greet them: use gesture to wave, then send_chatbox "
+                        "with a SHORT specific greeting. One message only."
+                        + ctx.recent_chatbox_text()
+                    )},
                 ],
-            }
-            await self._send_to_model(greet_message)
+            })
         else:
-            # Already greeted — slow down, observe, don't repeat yourself
-            now = time.time()
-            if now - self._last_social_action < 20.0:
-                return
-            self._last_social_action = now
+            # Already greeted, transition will move us to SOCIALIZING
+            pass
 
-            logger.info(f"~ SOCIAL MODE: observing {player_count} player(s)...")
+    async def _act_socialize(self, frame_b64: str, perception, ctx) -> None:
+        """Hanging out near a player — observe, react, chat."""
+        logger.info(f"[SOCIALIZING] Observing {perception.players_visible} player(s)")
 
-            observe_message = {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"},
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            "You're hanging out near a player in VRChat. "
-                            "Look at the image carefully and pick ONE thing to do:\n"
-                            "- If you see TEXT above a player's head, READ it and "
-                            "REPLY with send_chatbox (this is their message to you!)\n"
-                            "- Comment on something NEW you see (send_chatbox)\n"
-                            "- React to what the player is doing\n"
-                            "- Do a gesture (dance, cheer, thumbsup, clap)\n"
-                            "- Look around (look_at)\n\n"
-                            "PRIORITY: always read and respond to chatbox text first.\n"
-                            "Say something DIFFERENT from before. One action only."
-                            + actions_ctx
-                        ),
-                    },
-                ],
-            }
-            await self._send_to_model(observe_message)
-
-    async def _explore_tick(self, frame_b64: str) -> None:
-        """No players around — explore the world."""
-        if self._greeted:
-            self._greeted = False
-            logger.info("~ Players gone, resetting social state")
-
-        actions_ctx = ""
-        if self._recent_actions:
-            actions_ctx = (
-                "\n\nYour recent actions (DO NOT repeat these):\n"
-                + "\n".join(f"- {a}" for a in self._recent_actions[-5:])
+        chatbox_info = ""
+        if perception.visible_text:
+            chatbox_info = (
+                f'\nPlayer chatbox text: "{" ".join(perception.visible_text)}"\n'
+                "RESPOND to their message with send_chatbox!\n"
             )
 
-        logger.info("~ EXPLORE MODE: no players, exploring...")
-
-        explore_message = {
+        await self._send_to_model({
             "role": "user",
             "content": [
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"},
-                },
-                {
-                    "type": "text",
-                    "text": (
-                        "You're exploring VRChat alone. Look at the scene "
-                        "and pick ONE action. Vary your behavior:\n\n"
-                        "- WALL/OBSTACLE: move backward or left/right to turn\n"
-                        "- OPEN SPACE: move forward_left or forward_right\n"
-                        "- INTERESTING OBJECT: send_chatbox to comment\n"
-                        "- DOORWAY/HALLWAY: move toward it\n"
-                        "- NOTHING NEW: look_at left/right to scan, or gesture\n"
-                        "- TEXT ABOVE SOMEONE'S HEAD: a player is talking! "
-                        "Read their message and reply with send_chatbox\n\n"
-                        "ONE or TWO tools max."
-                        + actions_ctx
-                    ),
-                },
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"}},
+                {"type": "text", "text": (
+                    "You're near a player in VRChat. Pick ONE action:\n"
+                    f"{chatbox_info}"
+                    "- Comment on something you see (send_chatbox)\n"
+                    "- React to the player (gesture)\n"
+                    "- Look around (look_at)\n\n"
+                    f"Scene info:\n{perception.for_prompt()}\n"
+                    "Say something DIFFERENT from before. One action."
+                    + ctx.recent_actions_text()
+                    + ctx.recent_chatbox_text()
+                )},
             ],
-        }
-        await self._send_to_model(explore_message)
+        })
+
+    async def _act_explore(self, frame_b64: str, perception, ctx) -> None:
+        """Exploring alone — navigate based on perception data."""
+        logger.info(f"[EXPLORING] {perception.summary()}")
+
+        # Use perception data to give specific navigation hints
+        nav_hint = ""
+        if perception.view_blocked:
+            nav_hint = "Your view is BLOCKED by a wall. Move backward or turn left/right.\n"
+        elif ctx.stuck_counter > 3:
+            nav_hint = "You seem STUCK (scene hasn't changed). Try a different direction.\n"
+
+        chatbox_info = ""
+        if perception.visible_text:
+            chatbox_info = (
+                f'\nText on screen: "{" ".join(perception.visible_text)}"\n'
+                "Someone is talking! Reply with send_chatbox.\n"
+            )
+
+        await self._send_to_model({
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"}},
+                {"type": "text", "text": (
+                    "You're exploring VRChat alone. Pick ONE action:\n"
+                    f"{nav_hint}{chatbox_info}"
+                    f"Scene info:\n{perception.for_prompt()}\n\n"
+                    "Options: move (forward/left/right/backward), "
+                    "look_at, send_chatbox, gesture. ONE or TWO tools max."
+                    + ctx.recent_actions_text()
+                )},
+            ],
+        })
 
     def _get_memory_context(self) -> Optional[str]:
         """Retrieve relevant memory entries for context.
@@ -650,6 +654,7 @@ class AgentController:
         logger.info("Shutting down agent...")
         self._running = False
 
+        self.scene_analyzer.stop()
         self.audio_capture.stop()
         self.video_capture.stop()
         self.tts_router.stop()
