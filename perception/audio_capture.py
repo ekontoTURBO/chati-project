@@ -68,23 +68,31 @@ class AudioCaptureProcessor:
         self.muted = False
 
     def _find_loopback_device(self) -> dict:
-        """Find the CABLE In 16ch loopback device."""
+        """Find the best loopback device for capturing VRChat audio.
+
+        Priority:
+        1. Default output device loopback (headphones) — you hear VRChat
+           AND the agent captures it via loopback
+        2. CABLE In 16ch loopback — fallback if no default output
+        """
+        # Look for Realtek speakers loopback (main audio output)
+        for i in range(self._pa.get_device_count()):
+            d = self._pa.get_device_info_by_index(i)
+            if (d.get("isLoopbackDevice", False)
+                    and "speakers (realtek" in d["name"].lower()):
+                logger.info(
+                    f"Using Realtek loopback: [{i}] {d['name']} "
+                    f"({d['maxInputChannels']}ch, {int(d['defaultSampleRate'])}Hz)"
+                )
+                return d
+
+        # Fallback: CABLE In 16ch loopback
         for i in range(self._pa.get_device_count()):
             d = self._pa.get_device_info_by_index(i)
             if (d.get("isLoopbackDevice", False)
                     and "cable in 16ch" in d["name"].lower()):
                 logger.info(
-                    f"Using WASAPI loopback: [{i}] {d['name']} "
-                    f"({d['maxInputChannels']}ch, {int(d['defaultSampleRate'])}Hz)"
-                )
-                return d
-
-        for i in range(self._pa.get_device_count()):
-            d = self._pa.get_device_info_by_index(i)
-            if (d.get("isLoopbackDevice", False)
-                    and "cable" in d["name"].lower()):
-                logger.info(
-                    f"Using WASAPI loopback (fallback): [{i}] {d['name']}"
+                    f"Using WASAPI loopback (cable): [{i}] {d['name']}"
                 )
                 return d
 

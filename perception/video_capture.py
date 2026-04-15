@@ -31,8 +31,8 @@ logger = logging.getLogger("perception.video")
 TARGET_WIDTH = 768
 TARGET_HEIGHT = 432
 
-# Capture interval in seconds — 1 FPS is the sweet spot for VRAM
-CAPTURE_INTERVAL = 1.0
+# Capture interval in seconds — 3 FPS for perception layer
+CAPTURE_INTERVAL = 0.33
 
 # JPEG quality for encoding — lower = smaller base64, less detail
 JPEG_QUALITY = 70

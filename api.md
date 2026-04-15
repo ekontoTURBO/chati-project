@@ -83,6 +83,29 @@ All tools are exposed as function calls to the Gemma 4 model via Ollama's OpenAI
 
 ---
 
+## turn
+
+**Description:** Rotate the avatar's body left or right in place.
+
+**Parameters:**
+```json
+{
+  "direction": "string — Turn direction (left|right)",
+  "amount": "string — How far to turn: slight (45deg), quarter (90deg), half (180deg). Default: quarter"
+}
+```
+
+**Success Response:**
+```json
+{
+  "success": true,
+  "direction": "left",
+  "amount": "quarter"
+}
+```
+
+---
+
 ## jump
 
 **Description:** Make the avatar jump.

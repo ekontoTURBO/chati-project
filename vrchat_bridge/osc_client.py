@@ -209,6 +209,14 @@ class VRChatOSCClient:
         """
         self.send("/input/LookVertical", value)
 
+    def voice(self, active: bool = True) -> None:
+        """Toggle voice/microphone input (push-to-talk).
+
+        Args:
+            active: True to activate mic, False to deactivate
+        """
+        self.send("/input/Voice", 1 if active else 0)
+
     def run(self, running: bool = True) -> None:
         """Toggle running mode.
 

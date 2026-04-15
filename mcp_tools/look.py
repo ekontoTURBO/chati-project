@@ -39,6 +39,68 @@ class LookTool:
         # OSC client for sending look direction commands
         self.osc_client = osc_client
 
+    def turn(self, direction: str = "left", amount: str = "quarter") -> dict:
+        """Rotate the avatar's body by turning in place.
+
+        Args:
+            direction: 'left' or 'right'
+            amount: 'slight' (45deg), 'quarter' (90deg), 'half' (180deg)
+
+        Returns:
+            Status dict
+        """
+        direction = direction.lower().strip()
+        amount = amount.lower().strip()
+
+        if direction not in ("left", "right"):
+            return {"success": False, "error": f"Invalid turn direction: {direction}"}
+
+        # Duration determines how far we rotate
+        durations = {"slight": 0.3, "quarter": 0.6, "half": 1.2}
+        duration = durations.get(amount, 0.6)
+
+        h_val = -1.0 if direction == "left" else 1.0
+        logger.info(f"Turning {direction} ({amount}, {duration}s)")
+
+        try:
+            self.osc_client.look_horizontal(h_val)
+            time.sleep(duration)
+            self.osc_client.look_horizontal(0.0)
+            return {"success": True, "direction": direction, "amount": amount}
+        except Exception as e:
+            self.osc_client.look_horizontal(0.0)
+            logger.error(f"Turn failed: {e}")
+            return {"success": False, "error": str(e)}
+
+    @property
+    def turn_schema(self) -> dict:
+        """MCP tool definition for the turn tool."""
+        return {
+            "name": "turn",
+            "description": (
+                "Rotate the avatar's body left or right. "
+                "Use this to look in a new direction or turn around. "
+                "amount: slight (45deg), quarter (90deg), half (180deg)"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "direction": {
+                        "type": "string",
+                        "description": "Turn direction",
+                        "enum": ["left", "right"],
+                    },
+                    "amount": {
+                        "type": "string",
+                        "description": "How far to turn",
+                        "enum": ["slight", "quarter", "half"],
+                        "default": "quarter",
+                    },
+                },
+                "required": ["direction"],
+            },
+        }
+
     def look_at(self, target: str) -> dict:
         """Set the avatar's head/eye look direction.
 

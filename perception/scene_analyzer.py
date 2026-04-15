@@ -23,7 +23,7 @@ import numpy as np
 logger = logging.getLogger("perception.scene")
 
 # How often to run full analysis (seconds)
-ANALYSIS_INTERVAL = 1.0
+ANALYSIS_INTERVAL = 0.33  # ~3 FPS for perception
 
 # Frame difference threshold to consider "scene changed"
 CHANGE_THRESHOLD = 15.0
@@ -119,6 +119,14 @@ class SceneAnalyzer:
         self._thread: Optional[threading.Thread] = None
         self._prev_frame_gray: Optional[np.ndarray] = None
 
+        # Background model for motion detection (MOG2)
+        self._bg_subtractor = cv2.createBackgroundSubtractorMOG2(
+            history=120, varThreshold=40, detectShadows=False,
+        )
+
+        # Set by the controller when agent is moving/turning
+        self.agent_is_moving = False
+
         # Models (loaded lazily on start)
         self._yolo = None
         self._ocr = None
@@ -143,18 +151,24 @@ class SceneAnalyzer:
         logger.info("Scene analyzer stopped.")
 
     def _load_models(self) -> None:
-        """Load YOLO and OCR models."""
-        # YOLO11 nano — tiny, fast, ~50MB VRAM
+        """Load YOLO and OCR models.
+
+        EasyOCR is loaded first (CPU mode) to avoid cuDNN symbol
+        conflicts when loading after YOLO on a background thread.
+        """
+        # EasyOCR first — CPU mode avoids GPU conflicts
+        logger.info("Loading EasyOCR model (CPU)...")
+        import easyocr
+        self._ocr = easyocr.Reader(["en"], gpu=False, verbose=False)
+        logger.info("EasyOCR loaded.")
+
+        # YOLO11 nano — tiny, fast even on CPU
         logger.info("Loading YOLO11 nano model...")
         from ultralytics import YOLO
         self._yolo = YOLO("yolo11n.pt")
-        logger.info("YOLO11 nano loaded.")
-
-        # EasyOCR — text detection, ~1.2GB VRAM
-        logger.info("Loading EasyOCR model...")
-        import easyocr
-        self._ocr = easyocr.Reader(["en"], gpu=True, verbose=False)
-        logger.info("EasyOCR loaded.")
+        # Force CPU to avoid cuDNN symbol mismatch with CUDA 13.2 driver
+        self._yolo_device = "cpu"
+        logger.info("YOLO11 nano loaded (CPU mode).")
 
     def get_state(self) -> PerceptionState:
         """Get the latest perception state (thread-safe)."""
@@ -175,14 +189,21 @@ class SceneAnalyzer:
                 # 1. Frame differencing — fast, CPU only
                 self._detect_scene_change(frame, state)
 
-                # 2. YOLO detection — GPU, ~5ms for nano
+                # 2. Motion-based player detection (only when standing still)
+                if not self.agent_is_moving:
+                    self._detect_players_motion(frame, state)
+                else:
+                    # Feed frame to bg model so it adapts, but don't detect
+                    self._bg_subtractor.apply(frame, learningRate=0.1)
+
+                # 3. YOLO detection — supplement with object detection
                 self._detect_objects(frame, state)
 
-                # 3. OCR — GPU, only if players visible or text likely
-                if state.players_visible > 0 or state.scene_changed:
+                # 4. OCR — CPU, only if players visible
+                if state.players_visible > 0:
                     self._detect_text(frame, state)
 
-                # 4. Check if view is blocked
+                # 5. Check if view is blocked
                 self._check_view_blocked(frame, state)
 
                 # Update shared state
@@ -209,15 +230,62 @@ class SceneAnalyzer:
 
         self._prev_frame_gray = gray
 
+    def _detect_players_motion(self, frame: np.ndarray, state: PerceptionState) -> None:
+        """Detect players using background subtraction (motion detection).
+
+        Works with ANY avatar type — anime, furry, robot, anything.
+        Anything that moves and is large enough is treated as a player.
+        YOLO "person" detections are merged in as a bonus signal.
+        """
+        h, w = frame.shape[:2]
+        min_area = (h * w) * 0.005  # At least 0.5% of frame
+
+        # Apply background subtraction
+        fg_mask = self._bg_subtractor.apply(frame)
+
+        # Clean up noise
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
+
+        # Find contours of moving objects
+        contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        motion_players = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < min_area:
+                continue
+
+            x, y, cw, ch = cv2.boundingRect(contour)
+            # Normalize center position to 0-1
+            cx = (x + cw / 2) / w
+            cy = (y + ch / 2) / h
+
+            # Filter: player-sized objects are taller than wide (usually)
+            # and not too wide (not the whole background shifting)
+            aspect = ch / max(cw, 1)
+            if aspect > 0.5 and cw < w * 0.6:
+                motion_players.append((cx, cy))
+
+        # Set player count from motion (YOLO will supplement later)
+        if motion_players:
+            state.players_visible = len(motion_players)
+            state.player_positions = motion_players
+
     def _detect_objects(self, frame: np.ndarray, state: PerceptionState) -> None:
-        """Run YOLO11 nano for object/person detection."""
+        """Run YOLO11 nano for object detection.
+
+        YOLO "person" detections are merged with motion-based player
+        detection. Motion detection is primary (works with any avatar),
+        YOLO supplements with additional confidence.
+        """
         if self._yolo is None:
             return
 
-        results = self._yolo(frame, conf=YOLO_CONFIDENCE, verbose=False)
+        results = self._yolo(frame, conf=YOLO_CONFIDENCE, verbose=False, device=self._yolo_device)
 
         h, w = frame.shape[:2]
-        players = []
         objects = []
 
         for result in results:
@@ -227,7 +295,6 @@ class SceneAnalyzer:
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
                 label = result.names[cls_id]
 
-                # Normalize center position to 0-1
                 cx = ((x1 + x2) / 2) / w
                 cy = ((y1 + y2) / 2) / h
 
@@ -239,30 +306,67 @@ class SceneAnalyzer:
                 )
                 objects.append(obj)
 
-                # COCO "person" class — likely a player avatar
+                # YOLO person detection — add to player list if not
+                # already detected by motion
                 if cls_id == COCO_PERSON_CLASS:
-                    players.append((cx, cy))
+                    is_new = True
+                    for px, py in state.player_positions:
+                        if abs(px - cx) < 0.15 and abs(py - cy) < 0.15:
+                            is_new = False
+                            break
+                    if is_new:
+                        state.players_visible += 1
+                        state.player_positions.append((cx, cy))
 
-        state.players_visible = len(players)
-        state.player_positions = players
         state.objects = objects
 
     def _detect_text(self, frame: np.ndarray, state: PerceptionState) -> None:
-        """Run OCR to read chatbox text above player heads."""
+        """Run OCR to read chatbox text above player heads.
+
+        Focuses on the center of the frame and filters out VRChat
+        UI menu text (Friends, Social, Explore, etc.) which appears
+        on the edges.
+        """
         if self._ocr is None:
             return
 
-        # Focus on upper half of frame where chatbox text appears
-        h = frame.shape[0]
-        upper_half = frame[:h // 2]
+        h, w = frame.shape[:2]
+        # Focus on center-upper area where chatbox text appears
+        # Skip left 20% (VRChat menu sidebar) and bottom 50%
+        roi = frame[:h // 2, int(w * 0.2):int(w * 0.9)]
 
         try:
-            results = self._ocr.readtext(upper_half, detail=0, paragraph=True)
-            # Filter out very short results (noise)
-            texts = [t.strip() for t in results if len(t.strip()) > 2]
+            results = self._ocr.readtext(roi, detail=1, paragraph=False)
+            texts = []
+            for bbox, text, conf in results:
+                text = text.strip()
+                # Filter: must be 4+ chars, >50% confidence, not UI garbage
+                if (len(text) >= 4
+                        and conf > 0.5
+                        and not self._is_ui_text(text)):
+                    texts.append(text)
             state.visible_text = texts
         except Exception as e:
             logger.debug(f"OCR error: {e}")
+
+    @staticmethod
+    def _is_ui_text(text: str) -> bool:
+        """Check if text is likely VRChat UI rather than player chatbox."""
+        ui_keywords = {
+            "friends", "social", "explore", "settings", "safety",
+            "notifications", "avatar", "world", "menu", "camera",
+            "emote", "quick", "options", "search", "favorites",
+            "online", "offline", "status", "home", "invite",
+            "join", "block", "mute", "report", "exit",
+        }
+        lower = text.lower().strip()
+        # Exact match or very close to a UI keyword
+        if lower in ui_keywords:
+            return True
+        # Very short garbled text is likely OCR noise from UI
+        if len(text) < 5 and not text.replace(" ", "").isalpha():
+            return True
+        return False
 
     def _check_view_blocked(self, frame: np.ndarray, state: PerceptionState) -> None:
         """Check if the view is blocked (wall, close-up obstacle).

@@ -94,22 +94,12 @@ class SpeakTool:
         logger.info(f"Speaking: {text[:80]}...")
 
         try:
-            # Synthesize audio — Piper returns raw PCM bytes
-            # Use a BytesIO buffer to collect the full audio
-            audio_buffer = io.BytesIO()
+            # Synthesize audio with Piper — returns generator of AudioChunks
+            raw_pcm = b""
+            for chunk in self._voice.synthesize(text):
+                raw_pcm += chunk.audio_int16_bytes
 
-            # Create a WAV writer to properly frame the PCM data
-            with wave.open(audio_buffer, "wb") as wav_file:
-                wav_file.setnchannels(1)  # Mono
-                wav_file.setsampwidth(2)  # 16-bit
-                wav_file.setframerate(self._voice.config.sample_rate)
-
-                # Synthesize and write to buffer
-                self._voice.synthesize(text, wav_file)
-
-            # Extract raw PCM from WAV (skip header)
-            audio_buffer.seek(44)  # WAV header is 44 bytes
-            raw_pcm = audio_buffer.read()
+            logger.info(f"TTS generated {len(raw_pcm)} bytes of audio")
 
             # Update the router's sample rate to match this voice
             self.tts_router.sample_rate = self._voice.config.sample_rate

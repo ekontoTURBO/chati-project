@@ -16,9 +16,11 @@ class ChatboxTool:
         osc_client: VRChatOSCClient instance for sending messages
     """
 
-    def __init__(self, osc_client):
+    def __init__(self, osc_client, speak_tool=None):
         # OSC client for sending chatbox messages to VRChat
         self.osc_client = osc_client
+        # Optional speak tool — auto-speak every chatbox message
+        self._speak_tool = speak_tool
 
     def send_chatbox(self, text: str) -> dict:
         """Send a text message to VRChat's chatbox.
@@ -43,6 +45,20 @@ class ChatboxTool:
 
         try:
             self.osc_client.chatbox_message(text, direct=True)
+            # Auto-speak the message (strip emojis for TTS)
+            if self._speak_tool:
+                import re
+                # Remove emojis and other non-ASCII symbols
+                clean = re.sub(
+                    r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF'
+                    r'\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF'
+                    r'\U00002702-\U000027B0\U0000FE00-\U0000FE0F'
+                    r'\U0001F900-\U0001F9FF\U0001FA00-\U0001FA6F'
+                    r'\U0001FA70-\U0001FAFF\U00002600-\U000026FF'
+                    r'\U0000200D\U00002764]+', '', text
+                ).strip()
+                if clean:
+                    self._speak_tool.speak(clean)
             return {"success": True, "text": text}
         except Exception as e:
             logger.error(f"Chatbox send failed: {e}")

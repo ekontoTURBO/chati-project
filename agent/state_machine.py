@@ -54,6 +54,7 @@ class StateContext:
     stuck_counter: int = 0  # increments when scene doesn't change
     last_move_direction: str = ""
     explored_areas: int = 0
+    move_history: list = field(default_factory=list)  # last N directions moved
 
     # Recent actions (for anti-repetition)
     recent_actions: list = field(default_factory=list)
@@ -64,6 +65,11 @@ class StateContext:
         self.recent_actions.append(action)
         if len(self.recent_actions) > 10:
             self.recent_actions = self.recent_actions[-10:]
+        # Track movement directions separately
+        if action.startswith("move(") or action.startswith("turn("):
+            self.move_history.append(action)
+            if len(self.move_history) > 8:
+                self.move_history = self.move_history[-8:]
 
     def add_chatbox(self, text: str) -> None:
         """Track a recent chatbox message."""
@@ -78,6 +84,15 @@ class StateContext:
         return (
             "\n\nYour recent actions (DO NOT repeat these):\n"
             + "\n".join(f"- {a}" for a in self.recent_actions[-5:])
+        )
+
+    def movement_history_text(self) -> str:
+        """Format movement history for navigation awareness."""
+        if not self.move_history:
+            return ""
+        return (
+            "\n\nYour recent movement (vary direction, don't repeat):\n"
+            + "\n".join(f"- {m}" for m in self.move_history[-5:])
         )
 
     def recent_chatbox_text(self) -> str:
@@ -142,32 +157,40 @@ class AgentStateMachine:
         current = self.ctx.state
 
         if speech:
-            # Someone spoke — always enter CONVERSING
-            self._transition_to(AgentState.CONVERSING)
+            # Check for follow/come commands
+            lower = speech.lower()
+            follow_phrases = ["follow me", "come here", "come with me", "over here", "this way"]
+            stop_phrases = ["stop following", "stay here", "stop", "wait here", "don't follow"]
+
+            if any(p in lower for p in stop_phrases):
+                self._transition_to(AgentState.SOCIALIZING)
+            elif any(p in lower for p in follow_phrases):
+                self._transition_to(AgentState.FOLLOWING)
+            else:
+                self._transition_to(AgentState.CONVERSING)
 
         elif players > 0:
-            if current == AgentState.CONVERSING:
-                # Stay in conversation if recently heard speech
+            if current == AgentState.FOLLOWING:
+                pass  # Stay following until told to stop
+            elif current == AgentState.CONVERSING:
                 if now - self.ctx.last_speech_time > 15.0:
-                    # 15s since last speech — drop to socializing
                     self._transition_to(AgentState.SOCIALIZING)
             elif current in (AgentState.IDLE, AgentState.EXPLORING):
-                # Spotted a player — approach them
                 self._transition_to(AgentState.APPROACHING)
             elif current == AgentState.APPROACHING:
-                # Already approaching — switch to social after greeting
                 if self.ctx.greeted:
                     self._transition_to(AgentState.SOCIALIZING)
-            # SOCIALIZING stays as SOCIALIZING
 
         else:
             # No players visible
-            if current in (AgentState.SOCIALIZING, AgentState.CONVERSING,
+            if current == AgentState.FOLLOWING:
+                # Keep following even if player briefly out of sight
+                if now - self.ctx.last_speech_time > 10.0:
+                    self._transition_to(AgentState.EXPLORING)
+            elif current in (AgentState.SOCIALIZING, AgentState.CONVERSING,
                           AgentState.APPROACHING):
-                # Player left — go explore
                 self._transition_to(AgentState.EXPLORING)
             elif current == AgentState.IDLE:
                 self._transition_to(AgentState.EXPLORING)
-            # EXPLORING stays as EXPLORING
 
         return self.ctx.state

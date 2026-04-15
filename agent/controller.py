@@ -16,6 +16,11 @@ import json
 import time
 import logging
 import random
+
+# Disable cuDNN to prevent cudnnGetLibConfig crash
+# (PyTorch 2.5.1 cuDNN 9.1 vs CUDA 13.2 driver mismatch)
+import torch
+torch.backends.cudnn.enabled = False
 import sys
 import signal
 from pathlib import Path
@@ -99,8 +104,8 @@ class AgentController:
             recv_port=osc_recv_port,
         )
 
-        # TTS audio output → VB-Audio Cable
-        self.tts_router = TTSAudioRouter()
+        # TTS audio output → VB-Audio Cable (with push-to-talk via OSC)
+        self.tts_router = TTSAudioRouter(osc_client=self.osc)
 
         # Perception pipelines
         self.audio_capture = AudioCaptureProcessor()
@@ -113,7 +118,7 @@ class AgentController:
         self.look_tool = LookTool(self.osc)
         self.memory_tool = MemoryTool()
         self.environment_tool = EnvironmentTool(self.video_capture, self.client)
-        self.chatbox_tool = ChatboxTool(self.osc)
+        self.chatbox_tool = ChatboxTool(self.osc, speak_tool=self.speak_tool)
         self.world_tool = WorldTool()
 
         # Tool dispatch map — maps tool names to handler functions
@@ -128,6 +133,7 @@ class AgentController:
             "environment_query": self.environment_tool.environment_query,
             "send_chatbox": self.chatbox_tool.send_chatbox,
             "join_world": self.world_tool.join_world,
+            "turn": self.look_tool.turn,
         }
 
         # Conversation history — sliding window of messages
@@ -146,7 +152,7 @@ class AgentController:
         # Flag to control the main loop
         self._running = False
         # Last time we called the LLM for a decision
-        self._last_llm_action: float = 0.0
+        self._last_llm_action: float = time.time()
         # How often to call the LLM (seconds) — per state
         self._action_intervals = {
             AgentState.IDLE: 5.0,
@@ -173,6 +179,7 @@ class AgentController:
             self.environment_tool.tool_schema,
             self.chatbox_tool.tool_schema,
             self.world_tool.tool_schema,
+            self.look_tool.turn_schema,
         ]
         # Add jump as a separate tool
         schemas.append({
@@ -210,7 +217,7 @@ class AgentController:
         logger.info(f"Checking Ollama server at {self.model_url}...")
         try:
             models = self.client.models.list()
-            logger.info(f"vLLM server OK. Available models: {[m.id for m in models.data]}")
+            logger.info(f"Ollama server OK. Available models: {[m.id for m in models.data]}")
         except Exception as e:
             logger.error(f"Cannot reach vLLM server: {e}")
             logger.error("Make sure the vLLM Docker container is running: docker start chati-vllm")
@@ -453,10 +460,18 @@ class AgentController:
             return
 
         try:
+            # Flag movement to suppress motion detection during moves/turns
+            is_movement = func_name in ("move", "turn", "look_at")
+            if is_movement:
+                self.scene_analyzer.agent_is_moving = True
+
             if func_args:
                 result = handler(**func_args)
             else:
                 result = handler()
+
+            if is_movement:
+                self.scene_analyzer.agent_is_moving = False
 
             result_str = json.dumps(result, ensure_ascii=False)
             if len(result_str) > 300:
@@ -497,10 +512,44 @@ class AgentController:
             await self._act_approach(frame_b64, perception, ctx)
         elif state == AgentState.SOCIALIZING:
             await self._act_socialize(frame_b64, perception, ctx)
+        elif state == AgentState.FOLLOWING:
+            self._act_follow(perception)
         elif state == AgentState.CONVERSING:
             pass  # Handled by _handle_conversation
         elif state == AgentState.IDLE:
             await self._act_explore(frame_b64, perception, ctx)
+
+    def _act_follow(self, perception) -> None:
+        """Follow a player based on their detected position.
+
+        Uses the player's screen position to determine movement:
+        - Player left of center → turn left
+        - Player right of center → turn right
+        - Player small (far away) → move forward
+        - Player large (close) → stop, we're near them
+        """
+        if perception.players_visible == 0:
+            logger.info("[FOLLOWING] Lost sight of player, stopping")
+            self.move_tool.move(direction="stop")
+            return
+
+        px, py = perception.player_positions[0]
+        self.scene_analyzer.agent_is_moving = True
+
+        if px < 0.35:
+            logger.info(f"[FOLLOWING] Player at left ({px:.2f}), turning left")
+            self.look_tool.turn(direction="left", amount="slight")
+        elif px > 0.65:
+            logger.info(f"[FOLLOWING] Player at right ({px:.2f}), turning right")
+            self.look_tool.turn(direction="right", amount="slight")
+        elif py < 0.5:
+            logger.info(f"[FOLLOWING] Player ahead but far ({py:.2f}), moving forward")
+            self.move_tool.move(direction="forward", speed=0.8, duration=1.0)
+        else:
+            logger.info(f"[FOLLOWING] Player close and centered, keeping pace")
+            self.move_tool.move(direction="forward", speed=0.4, duration=0.5)
+
+        self.scene_analyzer.agent_is_moving = False
 
     async def _handle_conversation(self, speech: str, perception) -> None:
         """Handle a speech interaction — highest priority."""
@@ -508,6 +557,18 @@ class AgentController:
         ctx = self.state_machine.ctx
         ctx.conversation_turns += 1
         self._last_llm_action = time.time()
+
+        # Check if entering/exiting follow mode
+        state = self.state_machine.ctx.state
+        if state == AgentState.FOLLOWING:
+            logger.info("[FOLLOWING] Acknowledged! Following player.")
+            self.chatbox_tool.send_chatbox("Sure, I'll follow you!")
+            return
+        lower = speech.lower()
+        if any(p in lower for p in ["stop following", "stay here", "wait here"]):
+            logger.info("[FOLLOWING] Stop command received.")
+            self.chatbox_tool.send_chatbox("Okay, I'll stay here!")
+            return
 
         # Stop moving to listen
         self.move_tool.move(direction="stop")
@@ -527,10 +588,10 @@ class AgentController:
         content_parts.append({
             "type": "text",
             "text": (
-                f'A player said to you: "{speech}"\n\n'
-                f"Scene info:\n{perception_text}\n\n"
-                "Respond naturally with send_chatbox. You can also "
-                "use gesture to react. Keep it conversational and short."
+                f'Someone said: "{speech}"\n\n'
+                f"{perception_text}\n\n"
+                "React like a real person. One send_chatbox message. "
+                "Gesture if it fits the moment."
                 + ctx.recent_actions_text()
                 + ctx.recent_chatbox_text()
             ),
@@ -559,11 +620,12 @@ class AgentController:
                 "content": [
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"}},
                     {"type": "text", "text": (
-                        f"You see {perception.players_visible} player(s) in VRChat!\n"
-                        f"Scene info:\n{perception.for_prompt()}\n"
+                        f"You just noticed someone nearby.\n"
+                        f"{perception.for_prompt()}\n"
                         f"{chatbox_info}"
-                        "Greet them: use gesture to wave, then send_chatbox "
-                        "with a SHORT specific greeting. One message only."
+                        "Say hi — react to what you actually see. "
+                        "Comment on their avatar, what they're doing, the vibe. "
+                        "Wave with a gesture. One send_chatbox message."
                         + ctx.recent_chatbox_text()
                     )},
                 ],
@@ -588,13 +650,12 @@ class AgentController:
             "content": [
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"}},
                 {"type": "text", "text": (
-                    "You're near a player in VRChat. Pick ONE action:\n"
+                    "You're hanging out near someone. Look at the scene.\n"
                     f"{chatbox_info}"
-                    "- Comment on something you see (send_chatbox)\n"
-                    "- React to the player (gesture)\n"
-                    "- Look around (look_at)\n\n"
-                    f"Scene info:\n{perception.for_prompt()}\n"
-                    "Say something DIFFERENT from before. One action."
+                    f"{perception.for_prompt()}\n\n"
+                    "What would you naturally do? Maybe comment on "
+                    "something, react to what they're doing, do a gesture, "
+                    "or just vibe. Don't force it. One action max."
                     + ctx.recent_actions_text()
                     + ctx.recent_chatbox_text()
                 )},
@@ -624,12 +685,15 @@ class AgentController:
             "content": [
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"}},
                 {"type": "text", "text": (
-                    "You're exploring VRChat alone. Pick ONE action:\n"
+                    "You're on your own, just wandering around.\n"
                     f"{nav_hint}{chatbox_info}"
-                    f"Scene info:\n{perception.for_prompt()}\n\n"
-                    "Options: move (forward/left/right/backward), "
-                    "look_at, send_chatbox, gesture. ONE or TWO tools max."
+                    f"{perception.for_prompt()}\n\n"
+                    "What do you feel like doing? Walk somewhere, "
+                    "turn around to see what's behind you, comment "
+                    "on something interesting, do a little dance, "
+                    "whatever feels right. Use turn() to look in new directions."
                     + ctx.recent_actions_text()
+                    + ctx.movement_history_text()
                 )},
             ],
         })

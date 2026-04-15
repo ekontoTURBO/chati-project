@@ -21,6 +21,7 @@ venv/
 # --- Models (large binary files — download separately) ---
 models/piper/*.onnx
 models/piper/*.onnx.json
+yolo11n.pt
 
 # --- Database (agent memory — generated at runtime) ---
 agent_memory.db

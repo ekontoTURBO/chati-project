@@ -33,9 +33,10 @@ class TTSAudioRouter:
         channels: Number of audio channels (1 = mono)
     """
 
-    def __init__(self, sample_rate: int = 22050, channels: int = 1):
+    def __init__(self, sample_rate: int = 22050, channels: int = 1, osc_client=None):
         self.sample_rate = sample_rate
         self.channels = channels
+        self._osc = osc_client  # For push-to-talk control
 
         self._audio_queue: queue.Queue[Optional[np.ndarray]] = queue.Queue()
         self._device_index: Optional[int] = None
@@ -55,16 +56,7 @@ class TTSAudioRouter:
         Raises:
             RuntimeError: If no VB-Audio Cable is found
         """
-        # Prefer CABLE In 16ch (MME) — less likely to be locked
-        for i in range(self._pa.get_device_count()):
-            d = self._pa.get_device_info_by_index(i)
-            name = d["name"].lower()
-            api = self._pa.get_host_api_info_by_index(d["hostApi"])["name"]
-            if "cable in 16ch" in name and d["maxOutputChannels"] > 0 and api == "MME":
-                logger.info(f"Found VB-Audio Cable 16ch: [{i}] {d['name']}")
-                return d
-
-        # Fallback: regular CABLE Input
+        # Prefer regular CABLE Input (VRChat can see CABLE Output as mic)
         for i in range(self._pa.get_device_count()):
             d = self._pa.get_device_info_by_index(i)
             name = d["name"].lower()
@@ -72,6 +64,15 @@ class TTSAudioRouter:
                     and "16ch" not in name
                     and d["maxOutputChannels"] > 0):
                 logger.info(f"Found VB-Audio Cable: [{i}] {d['name']}")
+                return d
+
+        # Fallback: CABLE In 16ch
+        for i in range(self._pa.get_device_count()):
+            d = self._pa.get_device_info_by_index(i)
+            name = d["name"].lower()
+            api = self._pa.get_host_api_info_by_index(d["hostApi"])["name"]
+            if "cable in 16ch" in name and d["maxOutputChannels"] > 0 and api == "MME":
+                logger.info(f"Found VB-Audio Cable 16ch: [{i}] {d['name']}")
                 return d
 
         raise RuntimeError(
@@ -115,6 +116,7 @@ class TTSAudioRouter:
 
     def _play_loop(self) -> None:
         """Background loop that plays audio through VB-Audio Cable."""
+        logger.info("TTS play loop started.")
         while self._running:
             try:
                 audio = self._audio_queue.get(timeout=1.0)
@@ -126,8 +128,16 @@ class TTSAudioRouter:
 
             # Convert float32 to int16 bytes for pyaudio
             audio_int16 = (audio * 32767).astype(np.int16).tobytes()
+            logger.info(f"Playing {len(audio_int16)} bytes of audio...")
 
             try:
+                # Hold push-to-talk down before speaking
+                if self._osc:
+                    logger.info("PTT ON")
+                    for _ in range(3):
+                        self._osc.voice(True)
+                        time.sleep(0.05)
+
                 stream = self._pa.open(
                     format=pyaudio.paInt16,
                     channels=self.channels,
@@ -135,15 +145,29 @@ class TTSAudioRouter:
                     output=True,
                     output_device_index=self._device_index,
                 )
-                # Write audio in chunks to avoid buffer issues
+                # Write audio in chunks, keep PTT held
                 chunk_size = 4096
+                ptt_counter = 0
                 for offset in range(0, len(audio_int16), chunk_size):
                     if not self._running:
                         break
                     stream.write(audio_int16[offset:offset + chunk_size])
+                    # Re-send PTT every ~20 chunks to keep it held
+                    ptt_counter += 1
+                    if self._osc and ptt_counter % 20 == 0:
+                        self._osc.voice(True)
                 stream.stop_stream()
                 stream.close()
+
+                # Release push-to-talk after speaking
+                if self._osc:
+                    time.sleep(0.1)
+                    self._osc.voice(False)
+                    logger.info("PTT OFF")
+                logger.info("Playback complete.")
             except Exception as e:
+                if self._osc:
+                    self._osc.voice(False)
                 logger.error(f"Audio playback error: {e}")
                 time.sleep(0.5)
 

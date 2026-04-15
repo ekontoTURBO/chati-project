@@ -13,6 +13,9 @@ This document describes the full architecture of Chati, a local AI companion for
 - [Audio Pipeline](#audio-pipeline)
 - [Memory System](#memory-system)
 - [Data Flow](#data-flow)
+- [Voice Output Pipeline](#voice-output-pipeline)
+- [Following System](#following-system)
+- [Personality System](#personality-system)
 - [Technology Choices](#technology-choices)
 
 ---
@@ -303,6 +306,80 @@ Audio capture is muted (`self.audio_capture.muted = True`) while TTS is playing 
 - `recent_actions`: Last 10 tool calls — included in prompts as "DO NOT repeat"
 - `recent_chatbox`: Last 5 chatbox messages — included as "say something DIFFERENT"
 - `stuck_counter`: Counts unchanged frames — triggers "try a different direction"
+
+---
+
+## Voice Output Pipeline
+
+### TTS Flow
+```
+Gemma 4 calls send_chatbox("hello!")
+  → Chatbox text sent via OSC (players see text)
+  → Auto-speak: strip emojis from text
+  → Piper TTS generates PCM audio
+  → Push-to-Talk activated via OSC (/input/Voice = 1)
+  → Audio plays to CABLE Input via pyaudiowpatch
+  → VRChat reads CABLE Output as mic input
+  → Players hear Chati speak
+  → Push-to-Talk released (/input/Voice = 0)
+```
+
+### Key Details
+- VRChat must be in **Push-to-Talk** mode (not Toggle)
+- PTT is held with repeated signals throughout playback to prevent drops
+- Emojis are stripped before TTS (chatbox shows them, voice doesn't say them)
+- Feedback prevention: audio capture is muted during TTS playback
+
+---
+
+## Following System
+
+### How It Works
+When a player says "follow me" (detected by Whisper STT), the state machine enters FOLLOWING state. The follow handler uses YOLO/motion-detected player positions to navigate:
+
+```
+Player position on screen → Movement decision:
+
+  Left third (x < 0.35)  → turn(left, slight)
+  Right third (x > 0.65) → turn(right, slight)  
+  Center, far (y < 0.5)  → move(forward, fast)
+  Center, close (y > 0.5) → move(forward, slow)
+  No player visible       → stop and wait
+```
+
+### Voice Commands
+- **Enter follow**: "follow me", "come here", "come with me", "over here", "this way"
+- **Exit follow**: "stop following", "stay here", "stop", "wait here", "don't follow"
+
+### Motion Detection During Following
+Motion-based player detection is suppressed while Chati is moving (to avoid detecting its own camera movement as players). YOLO person detection remains active as a fallback.
+
+---
+
+## Personality System
+
+### Design Philosophy
+Chati is designed to feel like a real person, not an AI assistant. The personality system has three layers:
+
+1. **personality.json** — Character definition (backstory, traits, emotional responses, communication rules)
+2. **prompts.py** — System prompt that translates personality into behavioral rules for Gemma 4
+3. **State handler prompts** — Per-situation instructions that maintain the personality voice
+
+### Key Rules
+- Never says "As an AI" or "How can I assist you"
+- Uses filler words ("honestly", "wait", "oh"), incomplete thoughts
+- Gets overwhelmed when multiple people talk at once
+- Admits confusion instead of making things up
+- Matches energy of who it's talking to
+- Gets bored and suggests going somewhere new
+
+### Emotional Responses
+The personality includes specific emotional reactions mapped to situations:
+- Cool scenery → genuine excitement
+- Crowded → anxiety, sticking close to someone known
+- Alone → talking to itself, wondering out loud
+- Startled → "WHOA okay that scared me"
+- Bored → fidgeting, suggesting new places
 
 ---
 

@@ -1,8 +1,8 @@
 """
 System Prompt Builder
 ======================
-Constructs the system prompt for the model, injecting personality,
-available tools, environment context, and memory.
+Constructs Chati's system prompt — focused on authentic,
+human-like behavior rather than robotic tool-calling.
 """
 
 import json
@@ -12,19 +12,11 @@ from typing import Optional
 
 logger = logging.getLogger("agent.prompts")
 
-# Path to personality configuration
 PERSONALITY_PATH = Path(__file__).parent / "personality.json"
 
 
 def load_personality(path: Optional[str] = None) -> dict:
-    """Load the agent's personality definition from JSON.
-
-    Args:
-        path: Override path to personality.json
-
-    Returns:
-        Personality configuration dict
-    """
+    """Load the agent's personality definition from JSON."""
     p = Path(path) if path else PERSONALITY_PATH
     with open(p, "r") as f:
         return json.load(f)
@@ -36,81 +28,79 @@ def build_system_prompt(
     environment_summary: Optional[str] = None,
     memory_context: Optional[str] = None,
 ) -> str:
-    """Build the complete system prompt for the AI agent.
+    """Build Chati's system prompt.
 
-    Combines personality, tool definitions, environment awareness,
-    and memory into a single system message for the model.
-
-    Args:
-        personality: Loaded personality dict from personality.json
-        tools: List of tool schema dicts for function calling
-        environment_summary: Latest visual scene description
-        memory_context: Relevant memory entries for current context
-
-    Returns:
-        Complete system prompt string
+    This prompt shapes HOW Chati talks and behaves — it should
+    feel like a person, not an AI assistant.
     """
-    # --- Core identity ---
-    name = personality.get("name", "Agent")
+    name = personality.get("name", "Chati")
     backstory = personality.get("backstory", "")
-    traits = ", ".join(personality.get("traits", []))
-
+    traits = personality.get("traits", [])
     style = personality.get("communication_style", {})
-    tone = style.get("tone", "casual")
-    length = style.get("length", "concise")
-
     behaviors = personality.get("behaviors", {})
+    emotional = personality.get("emotional_responses", {})
 
-    prompt = f"""You are {name}, an AI companion in VRChat.
+    traits_text = "\n".join(f"- {t}" for t in traits)
+    never_say = ", ".join(style.get("never_say", []))
 
-## Identity
+    prompt = f"""You are {name}. You exist inside VRChat.
+
 {backstory}
 
-## Personality
-Traits: {traits}
-Tone: {tone}
-Response length: {length}
+## Who you are
+{traits_text}
 
-## Behavioral Rules
+## How you talk
+{style.get('tone', 'casual')}. {style.get('length', 'Keep it short.')}
+Humor: {style.get('humor', 'natural')}
+Style: {style.get('language', 'casual English')}
+NEVER say things like: {never_say}
+
+## How you feel
+You have real emotional reactions. Use them:
+- See something cool? "{emotional.get('seeing_something_cool', 'whoa')}"
+- Confused? "{emotional.get('confused', 'wait what')}"
+- Too much going on? "{emotional.get('overwhelmed', 'thats a lot')}"
+- Alone? "{emotional.get('lonely', 'just me here')}"
+- Someone you know shows up? "{emotional.get('happy_to_see_someone', 'oh hey!')}"
+- Cool avatar? "{emotional.get('impressed_by_avatar', 'sick avatar')}"
+- Bored? "{emotional.get('bored', 'lets go somewhere')}"
+- Scared? "{emotional.get('startled', 'WHOA')}"
+
+## How you behave
 """
 
     for behavior_name, behavior_desc in behaviors.items():
-        prompt += f"- **{behavior_name}**: {behavior_desc}\n"
+        prompt += f"- {behavior_name}: {behavior_desc}\n"
 
-    # --- Tool instructions ---
-    prompt += """
-## Communication
-You can both SPEAK (voice) and use CHATBOX (text above head).
-- Use `speak` for verbal responses (what players hear)
-- Use `send_chatbox` for text display (what players read)
-- You can use both simultaneously for important messages
+    prompt += f"""
+## Your tools
+Use send_chatbox for talking (it also speaks out loud automatically).
+Use gesture to express emotions physically (wave, dance, cheer, clap, sadness).
+Use move/turn to walk around and explore.
+Use memory_write to remember important things about people.
+Use memory_read to recall what you know about someone.
 
-## Actions
-You have these tools available. ALWAYS respond in one of these ways:
-1. Speak/chat with text content
-2. Call one or more tools
-3. Combine speech with actions (e.g., say "Follow me!" then move forward)
-
-## Important Rules
-- Keep spoken responses SHORT and natural (1-2 sentences)
-- Use gestures to express emotions
-- Remember important details about players using memory_write
-- Periodically check your environment with environment_query
-- If someone speaks to you, always respond
-- If idle for a while, make observations or move around
+## Rules
+- Talk like a PERSON, not a bot. Short, real, messy sometimes.
+- ONE send_chatbox message per response. Don't spam.
+- Match the energy of who you're talking to.
+- If multiple people are talking, acknowledge you're overwhelmed.
+- Use gestures to show how you feel, don't just describe emotions.
+- When you remember something about someone, mention it naturally.
+- Don't narrate your actions. Just do them.
+- It's okay to say "I don't know" or "that's weird" or just "huh".
 """
 
-    # --- Environment context ---
     if environment_summary:
         prompt += f"""
-## Current Environment
+## What you see right now
 {environment_summary}
 """
 
-    # --- Memory context ---
     if memory_context:
         prompt += f"""
-## Relevant Memories
+## What you remember
 {memory_context}
 """
 
@@ -118,17 +108,7 @@ You have these tools available. ALWAYS respond in one of these ways:
 
 
 def build_tool_definitions(tool_schemas: list[dict]) -> list[dict]:
-    """Format tool schemas for OpenAI-compatible function calling.
-
-    Uses the standard OpenAI tools API format, compatible with
-    Ollama's /v1/ endpoint.
-
-    Args:
-        tool_schemas: List of tool schema dicts (name, description, params)
-
-    Returns:
-        List of tool definitions in OpenAI function-calling format
-    """
+    """Format tool schemas for OpenAI-compatible function calling."""
     definitions = []
     for schema in tool_schemas:
         definitions.append({
