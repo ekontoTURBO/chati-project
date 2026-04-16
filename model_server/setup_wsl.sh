@@ -48,7 +48,7 @@ ollama serve &
 OLLAMA_PID=$!
 sleep 3
 
-ollama pull gemma4:e2b
+ollama pull gemma4:e4b
 
 echo ""
 echo "============================================"

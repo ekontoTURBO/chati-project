@@ -5,7 +5,7 @@
 
 model:
   # Ollama model tag — Gemma 4 E2B instruction-tuned (multimodal)
-  id: "gemma4:e2b"
+  id: "gemma4:e4b"
 
 server:
   # Host — Ollama binds to localhost by default

@@ -43,6 +43,11 @@ class TTSAudioRouter:
         self._player_thread: Optional[threading.Thread] = None
         self._running = False
         self._pa: Optional[pyaudio.PyAudio] = None
+        # Barge-in support: set this event to stop current playback
+        # and drop queued audio (Phase 3, AUDIT.md item 11)
+        self._cancel_event = threading.Event()
+        # True while the play loop is actively writing audio to the device
+        self._is_playing = False
 
     def _find_cable_input(self) -> dict:
         """Find a writable VB-Audio Cable device via pyaudiowpatch.
@@ -114,8 +119,36 @@ class TTSAudioRouter:
         """Queue a numpy audio array for playback."""
         self._audio_queue.put(audio_array)
 
+    def cancel(self) -> None:
+        """Stop current playback + drain queue (barge-in).
+
+        The play loop checks _cancel_event periodically; this sets it.
+        Also drains any queued audio so the next thing queued plays
+        instead of all the backlog.
+        """
+        self._cancel_event.set()
+        drained = 0
+        while not self._audio_queue.empty():
+            try:
+                self._audio_queue.get_nowait()
+                drained += 1
+            except queue.Empty:
+                break
+        if drained or self._is_playing:
+            logger.info(f"TTS cancelled (drained {drained} queued)")
+
+    @property
+    def is_playing(self) -> bool:
+        """True while audio is actively being written to the device."""
+        return self._is_playing
+
     def _play_loop(self) -> None:
-        """Background loop that plays audio through VB-Audio Cable."""
+        """Background loop that plays audio through VB-Audio Cable.
+
+        Respects self._cancel_event for barge-in: if set, the current
+        write loop exits early, PTT is released, and the next queued
+        item is fetched.
+        """
         logger.info("TTS play loop started.")
         while self._running:
             try:
@@ -126,17 +159,21 @@ class TTSAudioRouter:
             if audio is None:
                 break
 
-            # Convert float32 to int16 bytes for pyaudio
+            # Reset cancel event — only applies to future playback, not
+            # a previously-queued cancel
+            self._cancel_event.clear()
+
             audio_int16 = (audio * 32767).astype(np.int16).tobytes()
             logger.info(f"Playing {len(audio_int16)} bytes of audio...")
 
+            stream = None
             try:
                 # Hold push-to-talk down before speaking
                 if self._osc:
-                    logger.info("PTT ON")
                     for _ in range(3):
                         self._osc.voice(True)
                         time.sleep(0.05)
+                    logger.info("PTT ON")
 
                 stream = self._pa.open(
                     format=pyaudio.paInt16,
@@ -145,27 +182,45 @@ class TTSAudioRouter:
                     output=True,
                     output_device_index=self._device_index,
                 )
-                # Write audio in chunks, keep PTT held
+
+                self._is_playing = True
+                cancelled = False
+
                 chunk_size = 4096
                 ptt_counter = 0
                 for offset in range(0, len(audio_int16), chunk_size):
                     if not self._running:
                         break
+                    if self._cancel_event.is_set():
+                        cancelled = True
+                        logger.info("Playback interrupted (barge-in)")
+                        break
                     stream.write(audio_int16[offset:offset + chunk_size])
-                    # Re-send PTT every ~20 chunks to keep it held
                     ptt_counter += 1
                     if self._osc and ptt_counter % 20 == 0:
                         self._osc.voice(True)
+
                 stream.stop_stream()
                 stream.close()
+                stream = None
 
-                # Release push-to-talk after speaking
+                self._is_playing = False
+
                 if self._osc:
-                    time.sleep(0.1)
+                    time.sleep(0.05)
                     self._osc.voice(False)
                     logger.info("PTT OFF")
-                logger.info("Playback complete.")
+
+                if not cancelled:
+                    logger.info("Playback complete.")
             except Exception as e:
+                if stream is not None:
+                    try:
+                        stream.stop_stream()
+                        stream.close()
+                    except Exception:
+                        pass
+                self._is_playing = False
                 if self._osc:
                     self._osc.voice(False)
                 logger.error(f"Audio playback error: {e}")

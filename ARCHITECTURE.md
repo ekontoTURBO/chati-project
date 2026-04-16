@@ -87,7 +87,7 @@ Running on NVIDIA RTX 3090 (24 GB VRAM):
 
 | Component | VRAM | Model | Purpose |
 |-----------|------|-------|---------|
-| Gemma 4 E2B Q4 | ~8 GB | `gemma4:e2b` via Ollama | Reasoning, decisions, conversation |
+| Gemma 4 E2B Q4 | ~8 GB | `gemma4:e4b` via Ollama | Reasoning, decisions, conversation |
 | faster-whisper | ~1 GB | `base` model | Speech-to-text |
 | YOLO11 nano | ~50 MB | `yolo11n.pt` | Person/object detection |
 | EasyOCR | ~1.2 GB | English reader | Chatbox text recognition |
@@ -206,7 +206,7 @@ Persistent context tracks:
 
 ### Gemma 4 E2B via Ollama
 
-- **Model**: `gemma4:e2b` — Google's multimodal model (text + vision)
+- **Model**: `gemma4:e4b` — Google's multimodal model (text + vision)
 - **Quantization**: Q4_K_M (Ollama default) — fits in ~8GB VRAM
 - **Context**: 8192 tokens (reduced from 128K default to save VRAM)
 - **Server**: Ollama running in WSL2, port 11434

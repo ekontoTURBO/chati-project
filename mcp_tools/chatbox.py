@@ -19,8 +19,10 @@ class ChatboxTool:
     def __init__(self, osc_client, speak_tool=None):
         # OSC client for sending chatbox messages to VRChat
         self.osc_client = osc_client
-        # Optional speak tool — auto-speak every chatbox message
-        self._speak_tool = speak_tool
+        # NOTE: speak_tool param kept for backward compat but NOT used.
+        # The controller owns the decision to speak; chatbox should not
+        # have hidden TTS side-effects (see AUDIT.md section 1.7).
+        self._speak_tool = None
 
     def send_chatbox(self, text: str) -> dict:
         """Send a text message to VRChat's chatbox.

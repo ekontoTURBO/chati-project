@@ -42,6 +42,11 @@ TRANSCRIPTION_COOLDOWN = 3.0
 # "You" or "The" alone is probably background noise
 MIN_WORD_COUNT = 2
 
+# When Chati's TTS is playing, use a much higher threshold so only LOUD
+# barge-in speech triggers detection. This lets players interrupt Chati
+# mid-sentence without the agent hearing its own TTS feedback.
+BARGE_IN_THRESHOLD_MULTIPLIER = 4.0
+
 
 class AudioCaptureProcessor:
     """Captures VRChat audio and transcribes speech with Whisper.
@@ -70,8 +75,6 @@ class AudioCaptureProcessor:
         # Speech state tracking
         self._is_speaking = False
         self._speech_buffer: list[np.ndarray] = []
-        # Stereo buffer — used for direction-of-arrival (DOA) computation
-        self._stereo_buffer: list[np.ndarray] = []
         self._silence_start: float = 0.0
         self._last_transcription_time: float = 0.0
 
@@ -186,41 +189,40 @@ class AudioCaptureProcessor:
                     )
                     raw = np.frombuffer(data, dtype=np.float32)
 
-                    # Keep stereo for DOA, produce mono for Whisper
+                    # Downmix to mono — DOA removed per AUDIT.md 1.3
                     if channels > 1:
-                        stereo = raw.reshape(-1, channels)
-                        mono = stereo.mean(axis=1)
+                        mono = raw.reshape(-1, channels).mean(axis=1)
                     else:
-                        stereo = np.column_stack([raw, raw])
                         mono = raw
 
-                    # Skip if muted (TTS playing) or in cooldown
-                    if self.muted:
-                        continue
+                    # Cooldown still hard-skips (prevents hallucination spam)
                     if time.time() - self._last_transcription_time < TRANSCRIPTION_COOLDOWN:
                         continue
 
-                    # Check energy — only react to nearby/loud voices
+                    # Check energy
                     energy = np.sqrt(np.mean(mono ** 2))
 
-                    if energy > SILENCE_THRESHOLD:
+                    # During TTS: only loud barge-in voices should trigger.
+                    # Chati's own TTS via loopback is typically below this.
+                    threshold = SILENCE_THRESHOLD
+                    if self.muted:
+                        threshold = SILENCE_THRESHOLD * BARGE_IN_THRESHOLD_MULTIPLIER
+
+                    if energy > threshold:
                         if not self._is_speaking:
                             self._is_speaking = True
                             logger.info(f"* Speech detected (energy={energy:.3f})")
                         self._speech_buffer.append(mono)
-                        self._stereo_buffer.append(stereo)
                         self._silence_start = 0.0
                     elif self._is_speaking:
                         if self._silence_start == 0.0:
                             self._silence_start = time.time()
                         self._speech_buffer.append(mono)
-                        self._stereo_buffer.append(stereo)
 
                         if time.time() - self._silence_start > SILENCE_AFTER_SPEECH:
                             self._transcribe_speech(native_rate)
                             self._is_speaking = False
                             self._speech_buffer.clear()
-                            self._stereo_buffer.clear()
                             self._silence_start = 0.0
 
                 except IOError as e:
@@ -229,39 +231,19 @@ class AudioCaptureProcessor:
         except Exception as e:
             logger.error(f"Audio capture error: {e}")
 
-    def _compute_direction(self) -> float:
-        """Compute direction-of-arrival from stereo buffer.
-
-        Returns:
-            Pan value in [-1, 1]:
-            -1 = fully left, 0 = center, 1 = fully right
-        """
-        if not self._stereo_buffer:
-            return 0.0
-        stereo = np.concatenate(self._stereo_buffer, axis=0)
-        if stereo.ndim < 2 or stereo.shape[1] < 2:
-            return 0.0
-        left_rms = float(np.sqrt(np.mean(stereo[:, 0] ** 2)))
-        right_rms = float(np.sqrt(np.mean(stereo[:, 1] ** 2)))
-        total = left_rms + right_rms
-        if total < 1e-6:
-            return 0.0
-        # Pan: -1=left, +1=right
-        return (right_rms - left_rms) / total
-
     def _transcribe_speech(self, native_rate: int) -> None:
         """Transcribe accumulated speech buffer with Whisper.
 
-        Applies filters to avoid transcribing background noise:
-        - Minimum duration (skip short bursts)
-        - Minimum word count (skip single-word noise)
-        - Cooldown between transcriptions
+        Applies filters to avoid transcribing background noise.
+        Cooldown is set on EVERY attempt (not just successful ones)
+        to prevent burning GPU on rejected hallucinations in noisy
+        lobbies (AUDIT.md section 3.4).
         """
         if not self._speech_buffer or not self._whisper:
             return
 
-        # Compute direction before consuming the stereo buffer
-        direction = self._compute_direction()
+        # Set cooldown up-front so rejected chunks still back off
+        self._last_transcription_time = time.time()
 
         speech = np.concatenate(self._speech_buffer)
 
@@ -287,7 +269,6 @@ class AudioCaptureProcessor:
             )
             text = " ".join(seg.text.strip() for seg in segments).strip()
 
-            # Filter out background noise transcriptions
             if not text:
                 logger.debug("* Transcription empty, skipping")
                 return
@@ -307,19 +288,17 @@ class AudioCaptureProcessor:
                 return
 
             logger.info(f'* Heard: "{text}"')
-            self._last_transcription_time = time.time()
 
             # Clear old queued transcriptions — only keep the latest
             while not self._chunk_queue.empty():
                 try:
                     self._chunk_queue.get_nowait()
-                except:
+                except queue.Empty:
                     break
 
             self._chunk_queue.put({
                 "text": text,
                 "duration": duration,
-                "direction": direction,  # -1=left, 0=center, 1=right
                 "timestamp": time.time(),
             })
 

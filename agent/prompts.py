@@ -1,8 +1,8 @@
 """
-System Prompt Builder
-======================
-Constructs Chati's system prompt — focused on authentic,
-human-like behavior rather than robotic tool-calling.
+System Prompt Builder — minimal, prompt-cache friendly.
+
+Target: ~800 chars static + whatever perception/memory/dialogue add.
+Based on AUDIT.md section 7.
 """
 
 import json
@@ -16,107 +16,74 @@ PERSONALITY_PATH = Path(__file__).parent / "personality.json"
 
 
 def load_personality(path: Optional[str] = None) -> dict:
-    """Load the agent's personality definition from JSON."""
+    """Load personality JSON."""
     p = Path(path) if path else PERSONALITY_PATH
-    with open(p, "r") as f:
+    with open(p, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _fmt_never_say(never_say) -> str:
+    """Safely format never_say — supports both list and comma-separated string."""
+    if isinstance(never_say, list):
+        return ", ".join(never_say)
+    if isinstance(never_say, str):
+        return never_say
+    return ""
 
 
 def build_system_prompt(
     personality: dict,
-    tools: list[dict],
+    tools: Optional[list[dict]] = None,
     environment_summary: Optional[str] = None,
     memory_context: Optional[str] = None,
+    dialogue_text: Optional[str] = None,
 ) -> str:
-    """Build Chati's system prompt.
+    """Build Chati's minimal system prompt.
 
-    This prompt shapes HOW Chati talks and behaves — it should
-    feel like a person, not an AI assistant.
+    Static part kept short so Ollama can cache the prefix.
+    Dynamic blocks (perception/memory/dialogue) go at the end.
     """
     name = personality.get("name", "Chati")
     backstory = personality.get("backstory", "")
     traits = personality.get("traits", [])
     style = personality.get("communication_style", {})
-    behaviors = personality.get("behaviors", {})
-    emotional = personality.get("emotional_responses", {})
+    never_say = _fmt_never_say(personality.get("never_say", []))
 
-    traits_text = "\n".join(f"- {t}" for t in traits)
-    never_say = ", ".join(style.get("never_say", []))
+    traits_line = ", ".join(traits)
+    tone = style.get("tone", "casual")
+    length = style.get("length", "short")
 
-    prompt = f"""You are {name}. You exist inside VRChat.
+    prompt = f"""You are {name}. You live in VRChat. {backstory}
 
-{backstory}
+You're {traits_line}. Tone: {tone}. Length: {length}.
 
-## Who you are
-{traits_text}
+Do NOT sound like an assistant. Never say: {never_say}.
 
-## How you talk
-{style.get('tone', 'casual')}. {style.get('length', 'Keep it short.')}
-Humor: {style.get('humor', 'natural')}
-Style: {style.get('language', 'casual English')}
-NEVER say things like: {never_say}
+Use send_chatbox to talk (also speaks aloud). Use gesture for emotes (wave, dance, clap, thumbsup, cheer, sadness). Use move/turn/look_at to navigate. Use memory_write/read for facts about people.
 
-## How you feel
-You have real emotional reactions. Use them:
-- See something cool? "{emotional.get('seeing_something_cool', 'whoa')}"
-- Confused? "{emotional.get('confused', 'wait what')}"
-- Too much going on? "{emotional.get('overwhelmed', 'thats a lot')}"
-- Alone? "{emotional.get('lonely', 'just me here')}"
-- Someone you know shows up? "{emotional.get('happy_to_see_someone', 'oh hey!')}"
-- Cool avatar? "{emotional.get('impressed_by_avatar', 'sick avatar')}"
-- Bored? "{emotional.get('bored', 'lets go somewhere')}"
-- Scared? "{emotional.get('startled', 'WHOA')}"
+One action per turn. Just do — don't narrate."""
 
-## How you behave
-"""
-
-    for behavior_name, behavior_desc in behaviors.items():
-        prompt += f"- {behavior_name}: {behavior_desc}\n"
-
-    prompt += f"""
-## Your tools
-Use send_chatbox for talking (it also speaks out loud automatically).
-Use gesture to express emotions physically (wave, dance, cheer, clap, sadness).
-Use move/turn to walk around and explore.
-Use memory_write to remember important things about people.
-Use memory_read to recall what you know about someone.
-
-## Rules
-- Talk like a PERSON, not a bot. Short, real, messy sometimes.
-- ONE send_chatbox message per response. Don't spam.
-- Match the energy of who you're talking to.
-- If multiple people are talking, acknowledge you're overwhelmed.
-- Use gestures to show how you feel, don't just describe emotions.
-- When you remember something about someone, mention it naturally.
-- Don't narrate your actions. Just do them.
-- It's okay to say "I don't know" or "that's weird" or just "huh".
-"""
-
+    blocks = []
     if environment_summary:
-        prompt += f"""
-## What you see right now
-{environment_summary}
-"""
-
+        blocks.append(f"\n\nScene:\n{environment_summary}")
     if memory_context:
-        prompt += f"""
-## What you remember
-{memory_context}
-"""
+        blocks.append(f"\n\nMemory:\n{memory_context}")
+    if dialogue_text:
+        blocks.append(f"\n\n{dialogue_text}")
 
-    return prompt.strip()
+    return prompt + "".join(blocks)
 
 
 def build_tool_definitions(tool_schemas: list[dict]) -> list[dict]:
-    """Format tool schemas for OpenAI-compatible function calling."""
-    definitions = []
-    for schema in tool_schemas:
-        definitions.append({
+    """Wrap tool schemas in OpenAI function-call format."""
+    return [
+        {
             "type": "function",
             "function": {
-                "name": schema["name"],
-                "description": schema["description"],
-                "parameters": schema.get("parameters", {}),
+                "name": s["name"],
+                "description": s["description"],
+                "parameters": s.get("parameters", {}),
             },
-        })
-    return definitions
+        }
+        for s in tool_schemas
+    ]

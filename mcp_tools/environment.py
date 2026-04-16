@@ -68,7 +68,7 @@ class EnvironmentTool:
         try:
             # Ask the model to describe what it sees
             response = self.model_client.chat.completions.create(
-                model="gemma4:e2b",
+                model="gemma4:e4b",
                 messages=[
                     {
                         "role": "user",
