@@ -12,17 +12,14 @@ import time
 
 logger = logging.getLogger("mcp.look")
 
-# Mapping of look targets to (horizontal, vertical) axis values
-# Constraint: Both axes range from -1.0 to 1.0
+# Mapping of look targets to (horizontal, vertical) axis values.
+# NOTE: VRChat OSC look inputs are velocity-based, not position-based —
+# setting them back to 0 stops rotation but doesn't recenter. That means
+# any nonzero vertical leaves permanent pitch drift. Horizontal-only
+# targets are safe because the yaw just wraps around.
 LOOK_TARGETS = {
     "left": (-1.0, 0.0),
     "right": (1.0, 0.0),
-    "up": (0.0, 1.0),
-    "down": (0.0, -1.0),
-    "up_left": (-0.7, 0.7),
-    "up_right": (0.7, 0.7),
-    "down_left": (-0.7, -0.7),
-    "down_right": (0.7, -0.7),
     "center": (0.0, 0.0),
     "reset": (0.0, 0.0),
 }

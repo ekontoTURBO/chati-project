@@ -20,17 +20,17 @@ class ChatboxTool:
         # OSC client for sending chatbox messages to VRChat
         self.osc_client = osc_client
         # NOTE: speak_tool param kept for backward compat but NOT used.
-        # The controller owns the decision to speak; chatbox should not
-        # have hidden TTS side-effects (see AUDIT.md section 1.7).
-        self._speak_tool = None
+        # The controller owns speech decisions (AUDIT.md section 1.7).
 
     def send_chatbox(self, text: str) -> dict:
         """Send a text message to VRChat's chatbox.
 
-        The message appears above the avatar's head in-game.
+        Appears above the avatar's head. VRChat caps chatbox at ~144
+        chars so longer text is truncated at a sentence boundary when
+        possible, with "..." appended.
 
         Args:
-            text: Message to display (max ~144 chars for VRChat)
+            text: Message to display
 
         Returns:
             Status dict with sent text
@@ -38,30 +38,22 @@ class ChatboxTool:
         if not text or not text.strip():
             return {"success": False, "error": "Empty text"}
 
-        # VRChat chatbox has a ~144 character limit
-        # Constraint: truncate to avoid OSC errors
-        if len(text) > 144:
-            text = text[:141] + "..."
+        display = text
+        if len(display) > 144:
+            # Try to cut at a sentence boundary
+            cutoff = display[:140]
+            for sep in (". ", "! ", "? ", "; "):
+                idx = cutoff.rfind(sep)
+                if idx > 60:
+                    cutoff = cutoff[:idx + 1]
+                    break
+            display = cutoff.rstrip() + "..."
 
-        logger.info(f"Chatbox: {text}")
+        logger.info(f"Chatbox: {display}")
 
         try:
-            self.osc_client.chatbox_message(text, direct=True)
-            # Auto-speak the message (strip emojis for TTS)
-            if self._speak_tool:
-                import re
-                # Remove emojis and other non-ASCII symbols
-                clean = re.sub(
-                    r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF'
-                    r'\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF'
-                    r'\U00002702-\U000027B0\U0000FE00-\U0000FE0F'
-                    r'\U0001F900-\U0001F9FF\U0001FA00-\U0001FA6F'
-                    r'\U0001FA70-\U0001FAFF\U00002600-\U000026FF'
-                    r'\U0000200D\U00002764]+', '', text
-                ).strip()
-                if clean:
-                    self._speak_tool.speak(clean)
-            return {"success": True, "text": text}
+            self.osc_client.chatbox_message(display, direct=True)
+            return {"success": True, "text": display}
         except Exception as e:
             logger.error(f"Chatbox send failed: {e}")
             return {"success": False, "error": str(e)}

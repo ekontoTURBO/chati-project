@@ -1,288 +1,233 @@
-# API Documentation — MCP Tools
+# API — MCP Tools
 
-All tools are exposed as function calls to the Gemma 4 model via Ollama's OpenAI-compatible function-calling API. The agent controller handles dispatching tool calls to the appropriate handler.
+All tools are exposed as OpenAI-style function calls to Gemma 4 E4B via Ollama. The controller dispatches them through `_tool_handlers` in `agent/controller.py`.
+
+**Removed from the LLM exposure:**
+- `join_world` — model autonomously launched VRChat windows unprompted. File `mcp_tools/world.py` stays on disk but isn't imported.
+- `environment_query` — never wired into the single-path controller (legacy from the old 3-tier system).
+
+**Notable quirks:**
+- Gemma 4 E4B often emits tool calls as text content instead of `tool_calls`. The controller has a regex parser (`_extract_pseudo_calls`) that catches `name{key:"value"}` and `name{key:<|"|>value<|"|>}` forms.
+- `send_chatbox` is the primary "talk" path — it also triggers TTS via the controller. `speak` exists as a standalone primitive but the LLM is told to use `send_chatbox`.
+
+---
+
+## send_chatbox
+
+Primary speech + text path. The text appears over the avatar's head **and** is spoken aloud via Piper TTS (emoji stripped first).
+
+**Parameters**
+```json
+{
+  "text": "string — message to display (≤144 chars; truncated at sentence boundary + '...' if longer)"
+}
+```
+
+**Success**
+```json
+{ "success": true, "text": "Hey there! Nice world!" }
+```
+
+**Errors**
+- `"Empty text"` — text was empty/whitespace.
 
 ---
 
 ## speak
 
-**Description:** Speak text aloud in VRChat using Piper TTS routed through VB-Audio Cable 16ch.
+Standalone Piper TTS primitive. The LLM is instructed to prefer `send_chatbox` instead (which combines chatbox + TTS).
 
-**Parameters:**
+**Parameters**
 ```json
-{
-  "text": "string — The text to speak aloud"
-}
+{ "text": "string — text to speak aloud" }
 ```
 
-**Success Response:**
-```json
-{
-  "success": true,
-  "text": "Hello, nice to meet you!"
-}
-```
-
-**Error Codes:**
-- `error: "Empty text provided"` — Text parameter was empty
-- `error: "piper-tts not installed..."` — Piper TTS dependency missing
-- `error: "Piper voice model not found..."` — ONNX model file not in models/piper/
+**Errors**
+- `"Empty text provided"`
+- `"piper-tts not installed..."`
+- `"Piper voice model not found..."` — ONNX missing from `models/piper/`.
 
 ---
 
 ## gesture
 
-**Description:** Trigger an avatar emote/gesture in VRChat via OSC. The emote plays for 2 seconds then resets to idle.
+Avatar emote via OSC. Plays for ~2 s then auto-resets to idle.
 
-**Parameters:**
+**Parameters**
 ```json
 {
-  "type": "string — Gesture name (wave|clap|point|cheer|dance|backflip|die|sadness|sad|happy|thumbsup|bow|reset)"
+  "type": "string — wave|clap|point|cheer|dance|backflip|die|sadness|sad|happy|thumbsup|bow|reset"
 }
 ```
 
-**Success Response:**
+Mapping of friendly aliases to VRChat emote IDs:
+
+| Name | ID | Name | ID |
+|------|----|------|----|
+| wave | 1 | dance | 5 |
+| clap | 2 | backflip | 6 |
+| point / thumbsup | 3 | die / bow | 7 |
+| cheer / happy | 4 | sadness / sad | 8 |
+| reset | 0 | | |
+
+**Success**
 ```json
-{
-  "success": true,
-  "gesture": "wave",
-  "emote_id": 1
-}
+{ "success": true, "gesture": "wave", "emote_id": 1 }
 ```
 
-**Error Codes:**
-- `error: "Unknown gesture: '...'"` — Invalid gesture name provided
+**Errors**
+- `"Unknown gesture: '...'"`
 
 ---
 
 ## move
 
-**Description:** Move the avatar in a specified direction in VRChat. Movement lasts for the given duration then stops automatically.
+Walks the avatar in a direction for `duration` seconds, then stops. **Blocking — uses `time.sleep(duration)` inside the async controller.** Barge-in cannot fire during a move.
 
-**Parameters:**
+**Parameters**
 ```json
 {
-  "direction": "string — Direction (forward|backward|back|left|right|forward_left|forward_right|stop)",
-  "speed": "number — Speed 0.0-1.0 (default: 1.0, optional)",
-  "duration": "number — Seconds to move (default: 1.0, optional)"
+  "direction": "string — forward|backward|back|left|right|forward_left|forward_right|stop",
+  "speed":     "number — 0.0..1.0, default 1.0 (>0.7 auto-enables run)",
+  "duration":  "number — seconds, clamped 0.1..10.0, default 1.0"
 }
 ```
 
-**Success Response:**
+Directions are avatar-local, not world-local — `forward` means whichever way the head currently points.
+
+**Success**
 ```json
-{
-  "success": true,
-  "direction": "forward",
-  "speed": 1.0,
-  "duration": 1.0
-}
+{ "success": true, "direction": "forward", "speed": 1.0, "duration": 1.0 }
 ```
 
-**Error Codes:**
-- `error: "Unknown direction: '...'"` — Invalid direction name
+**Errors**
+- `"Unknown direction: '...'"`
 
 ---
 
 ## turn
 
-**Description:** Rotate the avatar's body left or right in place.
+Rotate the avatar's body in place. Yaw-only, uses `/input/LookHorizontal` impulse.
 
-**Parameters:**
+**Parameters**
 ```json
 {
-  "direction": "string — Turn direction (left|right)",
-  "amount": "string — How far to turn: slight (45deg), quarter (90deg), half (180deg). Default: quarter"
+  "direction": "string — left|right",
+  "amount":    "string — slight (≈45°) | quarter (≈90°) | half (≈180°), default quarter"
 }
 ```
 
-**Success Response:**
+Durations: slight 0.3 s, quarter 0.6 s, half 1.2 s.
+
+**Success**
 ```json
-{
-  "success": true,
-  "direction": "left",
-  "amount": "quarter"
-}
-```
-
----
-
-## jump
-
-**Description:** Make the avatar jump.
-
-**Parameters:**
-```json
-{}
-```
-
-**Success Response:**
-```json
-{
-  "success": true,
-  "action": "jump"
-}
+{ "success": true, "direction": "left", "amount": "quarter" }
 ```
 
 ---
 
 ## look_at
 
-**Description:** Control avatar head/eye look direction. Sends a brief impulse (0.3s) then resets to center to prevent continuous rotation.
+Head direction — **horizontal only**. Vertical targets were removed because VRChat's `/input/LookVertical` is a velocity axis (not a position), so any non-zero vertical left permanent pitch drift.
 
-**Parameters:**
+**Parameters**
 ```json
-{
-  "target": "string — Direction (left|right|up|down|up_left|up_right|down_left|down_right|center|reset)"
-}
+{ "target": "string — left|right|center|reset" }
 ```
 
-**Success Response:**
+Sends a 0.3 s impulse then zeros the axis. `center` and `reset` both send `(0, 0)`.
+
+**Success**
 ```json
-{
-  "success": true,
-  "target": "left"
-}
+{ "success": true, "target": "left" }
 ```
 
-**Error Codes:**
-- `error: "Unknown look target: '...'"` — Invalid target name
+**Errors**
+- `"Unknown look target: '...'. Available: center, left, reset, right"`
+
+---
+
+## jump
+
+**Parameters**
+```json
+{}
+```
+
+**Success**
+```json
+{ "success": true, "action": "jump" }
+```
 
 ---
 
 ## memory_write
 
-**Description:** Store information in long-term SQLite memory.
+SQLite long-term store. Persists across sessions. Use for player names, recurring facts.
 
-**Parameters:**
+**Parameters**
 ```json
 {
-  "key": "string — Memory key (e.g., 'player_alice_name')",
-  "value": "string — Value to remember"
+  "key":   "string — e.g. 'player_alice_name'",
+  "value": "string — value to remember"
 }
 ```
 
-**Success Response:**
+**Success**
 ```json
-{
-  "success": true,
-  "key": "player_alice_name",
-  "value": "Alice"
-}
+{ "success": true, "key": "player_alice_name", "value": "Alice" }
 ```
 
-**Error Codes:**
-- `error: "Empty key"` — Key parameter was empty
+**Errors**
+- `"Empty key"`
 
 ---
 
 ## memory_read
 
-**Description:** Recall information from long-term memory.
-
-**Parameters:**
+**Parameters**
 ```json
-{
-  "key": "string — Memory key to look up"
-}
+{ "key": "string — key to look up" }
 ```
 
-**Success Response (found):**
+**Success (found)**
 ```json
-{
-  "success": true,
-  "found": true,
-  "key": "player_alice_name",
-  "value": "Alice",
-  "category": "general"
-}
+{ "success": true, "found": true, "key": "player_alice_name", "value": "Alice", "category": "general" }
 ```
 
-**Success Response (not found):**
+**Success (not found)**
 ```json
-{
-  "success": true,
-  "found": false,
-  "key": "unknown_key"
-}
+{ "success": true, "found": false, "key": "unknown_key" }
 ```
 
 ---
 
-## environment_query
+## Out-of-band controls (no tool — handled in `_tick` before LLM)
 
-**Description:** Analyze the current VRChat environment by sending the latest screen capture frame to Gemma 4 for visual analysis. Results are cached for 2 seconds.
+### Spatial cues → immediate turn
+| Phrase | Action |
+|--------|--------|
+| "behind you" / "behind me" / "turn around" | `turn(right, half)` |
+| "over here" / "look at me" / "look here" | logged, no pre-emptive action |
 
-**Parameters:**
-```json
-{}
-```
+### Follow commands → state transition only
+| Phrase | Action |
+|--------|--------|
+| "follow me" / "come with me" / "come here" | `state_machine.force_follow()` |
+| "stop following" / "stop follow" / "stay here" | `state_machine.force_stop_follow()` |
 
-**Success Response:**
-```json
-{
-  "success": true,
-  "scene": "A colorful Japanese garden with cherry blossom trees",
-  "players_visible": 2,
-  "players": ["Player in blue avatar near fountain", "Player dancing"],
-  "objects": ["fountain", "cherry trees", "lanterns"],
-  "mood": "peaceful and lively",
-  "activity": "players socializing and dancing"
-}
-```
-
-**Error Codes:**
-- `error: "No video frame available..."` — Screen capture not running
-- `error: "..."` — Ollama API call failure
+These execute before the LLM sees the utterance; Gemma still receives the text in the dialogue buffer so its reply can acknowledge the command.
 
 ---
 
-## send_chatbox
+## Interruption contract
 
-**Description:** Send a text message to VRChat's in-game chatbox display (appears above avatar's head).
+If a new player utterance arrives while Chati is generating OR speaking:
 
-**Parameters:**
-```json
-{
-  "text": "string — Message to display (max 144 characters)"
-}
-```
+1. `TTSAudioRouter.cancel()` — kills playback mid-chunk.
+2. `self._gen_id += 1` — any in-flight response becomes stale.
+3. `self._gen_task.cancel()` — cancels the `await AsyncOpenAI.chat.completions.create(...)` and propagates `CancelledError`.
+4. `dialogue.add_player(speech)` — new turn appended **before** the next generation.
+5. Next `_tick` schedules a fresh `_act(gen_id)`.
 
-**Success Response:**
-```json
-{
-  "success": true,
-  "text": "Hey there! Nice world!"
-}
-```
-
-**Error Codes:**
-- `error: "Empty text"` — Text parameter was empty
-
----
-
-## join_world
-
-**Description:** Join a VRChat world using the vrchat:// deep link protocol. VRChat must already be running.
-
-**Parameters:**
-```json
-{
-  "world_id": "string — VRChat world ID in wrld_xxxx format (optional)",
-  "world_name": "string — Known world name (optional)"
-}
-```
-
-**Known worlds:** the_black_cat, just_b_club, movie_and_chill, the_great_pug, midnight_rooftop, home
-
-**Success Response:**
-```json
-{
-  "success": true,
-  "world_id": "wrld_4cf554b4-430c-4f8f-b53e-1f294eed230b",
-  "world_name": "the_black_cat"
-}
-```
-
-**Error Codes:**
-- `error: "Unknown world name: '...'"` — World name not in known list
-- `error: "Provide either world_id or world_name"` — Neither parameter provided
+Late-completing responses check `gen_id != self._gen_id` and discard. The controller logs `[STALE] gen#N discarded` when this happens.

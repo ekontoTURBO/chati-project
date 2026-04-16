@@ -1,195 +1,200 @@
-# Chati — VRChat AI Agent
+# Chati — VRChat AI Companion
 
-A local, real-time AI companion for VRChat with **real-time computer vision** (YOLO11 + motion detection + OCR), **speech recognition** (Whisper), **voice output** (Piper TTS), and **multimodal reasoning** (Gemma 4 E2B) — all running locally on a single RTX 3090.
+A local, real-time AI companion for VRChat. Sees, hears, speaks, moves, and remembers — all on a single RTX 3090.
 
-Chati can see players (any avatar type), read chatbox messages, hear and understand speech, speak back with voice, move, gesture, follow players, remember facts, and explore VRChat worlds autonomously. It has a human-like personality — gets excited about cool things, overwhelmed in crowds, and bored when alone.
+Chati is **not an AI assistant** and doesn't pretend to be one. The personality is "something older than human, not an AI — bound inside VRChat." Quietly curious, a little wistful, sometimes wry. It watches, joins in when it wants to, and remembers what you've told it.
 
-> For the full technical deep-dive, see [ARCHITECTURE.md](ARCHITECTURE.md).
+> Full technical deep-dive: [ARCHITECTURE.md](ARCHITECTURE.md) · Tool API: [api.md](api.md)
 
-## Architecture
+## What it does
+
+- **Sees** — screen capture (mss) → YOLO11 person detection + MOG2 motion detection + EasyOCR chatbox reading + frame-diff change detection.
+- **Hears** — WASAPI loopback of your speakers → faster-whisper STT with VAD, silence-gap detection, and cooldowns.
+- **Speaks** — Piper TTS → VB-Audio Cable → VRChat mic, with auto push-to-talk via OSC. Emoji stripped before synthesis.
+- **Acts** — OSC movement, head turning, gestures, chatbox, short- and long-term memory.
+- **Interrupts** — if you speak while Chati is talking, TTS stops mid-sentence, the in-flight LLM call is cancelled, and the next response includes both of your utterances.
+
+## Architecture at a glance
 
 ```
-+================================================================+
-|  PERCEPTION LAYER (background threads, 3 FPS)                   |
-|                                                                 |
-|  Screen Capture -----> YOLO11 nano -----> object detection      |
-|  (mss, 3 FPS)    +--> Motion Detection -> player detection      |
-|                   |    (MOG2 bg sub)      (any avatar type)     |
-|                   +--> EasyOCR ---------> chatbox text           |
-|                   +--> Frame Diff ------> scene changes          |
-|                                                                 |
-|  Audio Capture -----> Whisper STT ------> speech transcription   |
-|  (Realtek loopback)   (faster-whisper)                          |
-+================================================================+
-              |                              |
-              v                              v
-+================================================================+
-|  STATE MACHINE           |  3-TIER RESPONSE SYSTEM              |
-|                          |                                      |
-|  IDLE -> EXPLORING       |  Tier 1: Intent matcher (<1ms)       |
-|       -> APPROACHING     |  Tier 2: Qwen 3.5 2B (~400ms)        |
-|       -> SOCIALIZING     |  Tier 3: Gemma 4 E2B vision (3-10s)  |
-|       -> CONVERSING      |                                      |
-|       -> FOLLOWING       |  Spatial memory + stereo DOA         |
-+================================================================+
-              |
-              v
-+================================================================+
-|  ACTION LAYER (MCP Tools -> VRChat OSC)                         |
-|                                                                 |
-|  speak (Piper TTS + PTT) | move/turn/look | chatbox | gesture  |
-|  memory read/write       | join_world     | follow player       |
-+================================================================+
++-----------------------------------------------------------+
+|  PERCEPTION (background threads)                          |
+|                                                           |
+|  mss screen cap (3 FPS) --+                               |
+|                            +-> scene_analyzer             |
+|  YOLO11 nano --------------+   (players/text/motion)      |
+|  MOG2 motion --------------+                              |
+|  EasyOCR ------------------+                              |
+|  frame diff ---------------+                              |
+|                                                           |
+|  WASAPI loopback -> faster-whisper -> transcription       |
++-----------------------------------------------------------+
+                          |
+                          v
++-----------------------------------------------------------+
+|  SignalsHub.snapshot()  (one read per tick)               |
+|    perception + latest_speech + tts_playing + frame       |
++-----------------------------------------------------------+
+                          |
+                          v
++-----------------------------------------------------------+
+|  AgentController._tick  (1 Hz)                            |
+|                                                           |
+|  1. snapshot                                              |
+|  2. new speech? -> cancel TTS + cancel gen_task           |
+|  3. state_machine.update (hysteresis)                     |
+|  4. spatial cue? -> immediate turn                        |
+|  5. should_act? -> async _act (cancellable)               |
++-----------------------------------------------------------+
+                          |
+                          v
++-----------------------------------------------------------+
+|  _act  ->  Gemma 4 E4B (AsyncOpenAI -> Ollama)            |
+|    system prompt + dialogue + scene + tools               |
+|    parse tool_calls + pseudo-calls (Gemma text format)    |
+|    dispatch to handlers                                    |
++-----------------------------------------------------------+
+                          |
+                          v
++-----------------------------------------------------------+
+|  ACTION LAYER                                             |
+|  send_chatbox (text + TTS)   gesture   move / turn        |
+|  look_at (horizontal)        jump      memory read/write  |
++-----------------------------------------------------------+
 ```
 
-## How It Works
+## State machine (3 states + hysteresis)
 
-1. **Real-Time Vision** (3 FPS): YOLO11 detects objects, motion detection finds player avatars of ANY type (anime, furry, robot — anything that moves), EasyOCR reads chatbox text, frame differencing detects scene changes.
-2. **Hearing** (Whisper STT + Stereo DOA): Captures audio from your speakers via WASAPI loopback, transcribes with faster-whisper. Analyzes L/R channel balance to detect **where sounds come from** (left/center/right).
-3. **Voice Output** (Piper TTS): Generates speech, plays to VB-Audio Cable with automatic push-to-talk via OSC.
-4. **3-Tier Response System**:
-   - **Tier 1 (instant)**: Regex-based intent matcher catches direct commands ("follow me", "stop", "turn left") — executes in <1ms, no LLM
-   - **Tier 2 (~400ms)**: Qwen 3.5 2B for fast text-only chat responses
-   - **Tier 3 (3-10s)**: Gemma 4 E2B for vision-heavy reasoning (describing scenes, reading avatars)
-5. **State Machine**: EXPLORING → APPROACHING → SOCIALIZING → CONVERSING → FOLLOWING
-6. **Spatial Memory**: Tracks player positions and sound directions over 10 seconds — "the player was on my left 3 seconds ago"
-7. **Personality**: Human-like reactions — gets excited, overwhelmed in crowds, admits confusion. Never sounds like an AI assistant.
+| State | Entry | Exit |
+|-------|-------|------|
+| **SOLO** | start, or long absence | player seen ≥3 ticks OR speech heard → ENGAGED |
+| **ENGAGED** | sustained player presence or conversation | 20 s silence AND 8 s no player → SOLO |
+| **FOLLOWING** | player says "follow me" | "stop following" OR 30 s no sighting → SOLO |
+
+No more flickering between states on single-frame detections. Old `APPROACHING` / `SOCIALIZING` / `CONVERSING` collapsed into `ENGAGED`.
+
+## Interruption model
+
+1. Player speech arrives mid-response.
+2. `TTSAudioRouter.cancel()` fires — play loop drains its queue, a `threading.Event` breaks chunk playback.
+3. `_gen_id += 1` invalidates the in-flight response; `_gen_task.cancel()` kills the HTTP request to Ollama.
+4. The utterance is appended to the dialogue buffer *before* the new generation starts, so Chati's next reply sees the interruption in context.
+
+Late-completing responses check `gen_id` and discard themselves.
 
 ## Requirements
 
-### Hardware
-- **GPU**: NVIDIA RTX 3090 (24 GB VRAM) or better
-- **OS**: Windows 11
+- **GPU** NVIDIA RTX 3090 (24 GB) or better
+- **OS** Windows 11 (WSL2 for Ollama)
+- **VRChat** OSC enabled, voice set to Push-to-Talk
+- **VB-Audio Cable** https://vb-audio.com/Cable/ (virtual mic for TTS → VRChat)
+- **Piper TTS voice** `en_US-amy-medium.onnx` + `.json` in `models/piper/`
 
-### Software Prerequisites
+## Audio routing
 
-1. **WSL2 (Ubuntu)**
-   ```powershell
-   wsl --install
-   ```
+| Path | Route |
+|------|-------|
+| Chati → players | Piper TTS → CABLE Input → VRChat mic (auto-PTT via OSC) |
+| Players → Chati | VRChat → Speakers (Realtek) → WASAPI loopback → Whisper |
+| You → everything | VRChat output → Speakers (Realtek) → headphones |
 
-2. **VB-Audio Cable** (virtual microphone for TTS → VRChat)
-   - Download: https://vb-audio.com/Cable/
-   - Install as Administrator, restart PC
+VRChat settings:
+- Output: **Speakers (Realtek)**
+- Input: **CABLE Output (VB-Audio Virtual Cable)**
+- Voice mode: **Push-to-Talk**
 
-3. **VRChat** with OSC enabled
-   - Action Menu → Options → OSC → Enabled
-   - Voice mode: **Push-to-Talk**
+## Install
 
-4. **Piper TTS Voice Model**
-   - Download `en_US-lessac-medium.onnx` + `.json` from https://github.com/rhasspy/piper/releases
-   - Place in `models/piper/`
-
-## Audio Routing
-
-| Route | How |
-|-------|-----|
-| **Chati speaks → players hear** | Piper TTS → CABLE Input → CABLE Output → VRChat mic (with auto PTT) |
-| **Players speak → Chati hears** | VRChat → Speakers (Realtek) → WASAPI loopback → Whisper STT |
-| **You hear everything** | VRChat output → Speakers (Realtek) → your headphones |
-
-**VRChat audio settings:**
-- Output: **Speakers (Realtek)** (you hear VRChat normally)
-- Input: **CABLE Output (VB-Audio Virtual Cable)** (VRChat reads TTS)
-- Voice: **Push-to-Talk** (agent controls PTT via OSC)
-
-## Installation
-
-### Step 1: Python dependencies (Windows)
 ```powershell
 cd chati-project
 pip install -r requirements.txt
 ```
 
-### Step 2: Ollama in WSL2
+Ollama in WSL2:
 ```bash
 cd /mnt/c/Users/YOUR_USERNAME/Desktop/chati-project/model_server
 bash setup_wsl.sh
-# Also pull the fast model for Tier 2 (recommended):
-ollama pull qwen3.5:2b
+ollama pull gemma4:e4b
 ```
 
-### Step 3: Piper voice model
+Piper voice:
 ```powershell
 mkdir models\piper
-# Download en_US-lessac-medium.onnx + .json from Piper releases
-# Place both in models/piper/
+# Drop en_US-amy-medium.onnx + .json into models/piper/
 ```
 
-## Running
+## Run
 
-### 1. Start Ollama (WSL2 terminal)
+WSL2 terminal:
 ```bash
 ollama serve
 ```
 
-### 2. Start the agent (Windows PowerShell)
+Windows:
 ```powershell
-cd chati-project
 python -m agent.controller
 ```
 
-### Voice Commands
-- **"follow me"** / **"come here"** / **"this way"** — Chati follows you
-- **"stop"** / **"stay here"** / **"stop following"** — Chati stops following
+## Voice shortcuts (no LLM round-trip)
 
-## Agent States
+| Say | Effect |
+|-----|--------|
+| "follow me" / "come here" / "come with me" | Force FOLLOWING state |
+| "stop following" / "stay here" | Exit FOLLOWING |
+| "behind you" / "turn around" | Immediate half-turn before LLM reacts |
+| "over here" / "look at me" / "look here" | Spatial cue logged |
 
-| State | Trigger | Behavior |
-|-------|---------|----------|
-| EXPLORING | No players nearby | Wanders, turns, comments on scenery |
-| APPROACHING | Player detected | Stops, waves, greets with chatbox + voice |
-| SOCIALIZING | After greeting | Hangs out, reacts to what's happening |
-| CONVERSING | Speech detected | Responds to what player said |
-| FOLLOWING | "Follow me" command | Tracks player position, follows movement |
+## Project structure
 
-## Project Structure
 ```
 chati-project/
-├── agent/                  # AI brain
-│   ├── controller.py       # Main loop (perception → state → reasoning → action)
-│   ├── state_machine.py    # Behavioral states (EXPLORING, FOLLOWING, etc.)
-│   ├── personality.json    # Chati's character — emotions, reactions, style
-│   └── prompts.py          # System prompt builder
-├── perception/             # Sensory input (real-time, background threads)
-│   ├── scene_analyzer.py   # YOLO11 + motion detection + EasyOCR
-│   ├── video_capture.py    # Screen capture via mss (3 FPS)
-│   └── audio_capture.py    # WASAPI loopback + Whisper STT
-├── mcp_tools/              # Agent capabilities (tool calls)
-│   ├── speak.py            # Piper TTS voice output
-│   ├── gesture.py          # Avatar emotes (wave, dance, etc.)
-│   ├── move.py             # Avatar locomotion
-│   ├── look.py             # Head direction + body rotation (turn)
-│   ├── memory.py           # Long-term memory (SQLite)
-│   ├── environment.py      # Gemma 4 deep scene analysis
-│   ├── chatbox.py          # VRChat chatbox (auto-speaks messages)
-│   └── world.py            # Join VRChat worlds via deep link
-├── vrchat_bridge/          # VRChat communication
-│   ├── osc_client.py       # OSC send/receive + push-to-talk
-│   └── tts_output.py       # Audio output to VB-Cable with PTT
-├── model_server/           # Ollama server config (WSL2)
-│   ├── config.yaml         # Server parameters
-│   ├── server.py           # Server launcher
-│   └── setup_wsl.sh        # WSL2 setup automation
-├── models/piper/           # TTS voice models (download separately)
-├── ARCHITECTURE.md         # Full technical architecture deep-dive
-├── api.md                  # MCP tool API reference
-├── requirements.txt        # Python dependencies
-└── README.md               # This file
+├── agent/
+│   ├── controller.py       # async main loop, interruptible _act, pseudo-call parser
+│   ├── signals.py          # SignalsHub — one snapshot per tick
+│   ├── state_machine.py    # 3-state FSM with hysteresis
+│   ├── dialogue.py         # rolling turn buffer (player/chati, timestamped)
+│   ├── prompts.py          # minimal prompt builder, cache-friendly
+│   └── personality.json    # identity rules, traits, never_say list
+├── perception/
+│   ├── scene_analyzer.py   # YOLO + MOG2 + EasyOCR + frame diff → PerceptionState
+│   ├── video_capture.py    # mss screen grab
+│   └── audio_capture.py    # WASAPI loopback + faster-whisper + VAD
+├── mcp_tools/
+│   ├── chatbox.py          # /chatbox/input — also triggers TTS
+│   ├── gesture.py          # VRCEmote (wave, dance, cheer, …)
+│   ├── move.py             # /input/Vertical + /input/Horizontal (timed hold)
+│   ├── look.py             # horizontal-only turn + look_at
+│   ├── memory.py           # SQLite long-term facts
+│   └── speak.py            # Piper TTS primitive (chatbox is the usual path)
+├── vrchat_bridge/
+│   ├── osc_client.py       # send/receive + push-to-talk hold
+│   └── tts_output.py       # pyaudiowpatch out to CABLE Input, cancellable
+├── model_server/
+│   └── setup_wsl.sh        # Ollama bootstrap for WSL2
+├── models/piper/           # TTS voice files (download separately)
+└── agent_memory.db         # SQLite memory store (created on first run)
 ```
 
 ## Troubleshooting
 
-| Problem | Solution |
-|---------|----------|
-| Can't hear Chati speak | VRChat input → CABLE Output, voice mode → Push-to-Talk |
-| Chati doesn't hear players | VRChat output → Speakers (Realtek) |
-| cuDNN error on startup | Harmless warning — YOLO/OCR run on CPU |
-| Screen capture black | VRChat must be in Borderless Windowed mode |
-| Ollama not connecting | Run `ollama serve` in WSL terminal first |
-| Chati detects too many players | Motion detection adapts over time, give it ~10s |
-| Whisper transcribes noise | Increase SILENCE_THRESHOLD in audio_capture.py |
-| Chati repeats itself | Recent actions/chatbox tracking prevents loops |
+| Problem | Fix |
+|---------|-----|
+| Chati silent | VRChat input → CABLE Output; voice mode → Push-to-Talk |
+| Chati hears nothing | VRChat output → Speakers (Realtek); check loopback device name matches `AudioCaptureProcessor` |
+| Screen capture black | Run VRChat in Borderless Windowed |
+| Ollama unreachable | `ollama serve` in WSL; confirm port 11434 |
+| Head drifts down | Fixed — vertical look targets removed (VRChat LookVertical is velocity, not position) |
+| Random VRChat window launched | Fixed — `join_world` tool removed from LLM exposure |
+| Chati reads tool syntax out loud | Fixed — pseudo-call parser strips `send_chatbox{text:"…"}` before TTS |
+| Chati says "it's quiet in here" | Added to `never_say` in personality.json |
+
+## Known limitations
+
+- `move()` uses blocking `time.sleep(duration)` — stalls perception ticks for up to 10 s. Barge-in can't fire during movement.
+- YOLO is trained on COCO, not VRChat avatars. Motion detection is the backstop for non-human avatars.
+- Gemma 4 E4B in Ollama emits tool calls as text content instead of proper `tool_calls`; parsed via regex. If Ollama ever fixes this, the parser becomes dead code.
+- Head rotation is horizontal-only. VRChat's `LookVertical` is a velocity input, so any non-zero vertical leaves permanent pitch drift.
 
 ## License
+
 MIT

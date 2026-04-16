@@ -12,6 +12,7 @@ See AUDIT.md for the rationale of this design.
 
 import asyncio
 import json
+import re
 import time
 import logging
 import sys
@@ -19,7 +20,111 @@ import signal
 from pathlib import Path
 from typing import Optional
 
-from openai import OpenAI
+
+# Emoji ranges — strip before sending to TTS (Piper reads them literally)
+_EMOJI_RE = re.compile(
+    "[\U0001F600-\U0001F64F"   # emoticons
+    "\U0001F300-\U0001F5FF"    # symbols & pictographs
+    "\U0001F680-\U0001F6FF"    # transport
+    "\U0001F1E0-\U0001F1FF"    # flags
+    "\U00002700-\U000027BF"    # dingbats
+    "\U0001F900-\U0001F9FF"    # supplemental
+    "\U00002600-\U000026FF"    # misc symbols
+    "\U0001FA70-\U0001FAFF"    # ext symbols A
+    "\U0001F780-\U0001F7FF"    # geometric ext
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def _strip_emojis(text: str) -> str:
+    """Remove emojis for TTS without modifying the chatbox text.
+
+    Also collapses runs of whitespace produced by emoji removal so
+    Piper doesn't get tripped up on double spaces.
+    """
+    no_emoji = _EMOJI_RE.sub("", text)
+    return re.sub(r"\s+", " ", no_emoji).strip()
+
+
+# Spatial cues in speech that should trigger a body turn
+_TURN_CUES = {
+    "behind you": ("right", "half"),
+    "behind me": ("right", "half"),
+    "turn around": ("right", "half"),
+    "over here": None,              # direction-less, just face speaker
+    "look at me": None,
+    "look here": None,
+}
+
+
+# Gemma 4 E4B often emits tool calls as text content rather than using the
+# OpenAI tool_calls format. Example: `send_chatbox{text:<|"|>hello<|"|>}`.
+# This regex extracts those pseudo-calls so we can execute them properly
+# instead of reading the syntax aloud. Supports both `<|"|>...<|"|>` and
+# plain `"..."` quoting.
+# Strict: value is between matching quote-delimiters
+_PSEUDO_QUOTED_RE = re.compile(
+    r"\*?(\w+)\s*\{\s*(\w+)\s*:\s*"
+    r"(?:<\|\"\|>|\"|')"
+    r"(.+?)"
+    r"(?:<\|\"\|>|\"|')"
+    r"\s*\}?\*?",
+    re.DOTALL,
+)
+
+# Forgiving: unquoted value up to } or newline (for simple args like
+# `gesture{type: wave}`)
+_PSEUDO_UNQUOTED_RE = re.compile(
+    r"\*?(\w+)\s*\{\s*(\w+)\s*:\s*"
+    r"([^\"'<{}\n]+?)"
+    r"\s*\}\*?",
+    re.DOTALL,
+)
+
+
+def _extract_pseudo_calls(text: str) -> tuple[list[dict], str]:
+    """Extract Gemma's pseudo-tool-calls from plain text content.
+
+    Tries the strict quoted pattern first (covers the `<|"|>...<|"|>` case).
+    Any leftover text is then scanned for unquoted tool syntax.
+
+    Returns (calls, leftover_text).
+    """
+    calls = []
+    remaining = text
+
+    # Pass 1: quoted values
+    new_calls_1 = []
+    for m in _PSEUDO_QUOTED_RE.finditer(remaining):
+        val = m.group(3).strip()
+        if val:
+            new_calls_1.append({
+                "name": m.group(1).strip(),
+                "arg_key": m.group(2).strip(),
+                "arg_value": val,
+            })
+    if new_calls_1:
+        calls.extend(new_calls_1)
+        remaining = _PSEUDO_QUOTED_RE.sub("", remaining)
+
+    # Pass 2: unquoted values (on what's left)
+    for m in _PSEUDO_UNQUOTED_RE.finditer(remaining):
+        val = m.group(3).strip()
+        if val and not val.startswith("<"):
+            calls.append({
+                "name": m.group(1).strip(),
+                "arg_key": m.group(2).strip(),
+                "arg_value": val,
+            })
+    remaining = _PSEUDO_UNQUOTED_RE.sub("", remaining)
+
+    # Clean up stray pipe/quote artifacts
+    remaining = re.sub(r"<\|[^|]*\|>", "", remaining)
+    remaining = re.sub(r"\*+", "", remaining).strip()
+    return calls, remaining
+
+from openai import OpenAI, AsyncOpenAI
 
 # Project root for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -35,7 +140,6 @@ from mcp_tools.move import MoveTool
 from mcp_tools.look import LookTool
 from mcp_tools.memory import MemoryTool
 from mcp_tools.chatbox import ChatboxTool
-from mcp_tools.world import WorldTool
 from agent.prompts import load_personality, build_system_prompt, build_tool_definitions
 from agent.state_machine import AgentStateMachine, AgentState
 from agent.dialogue import Dialogue
@@ -72,8 +176,12 @@ class AgentController:
         self.model_url = model_url
         self.model_name = model_name
 
-        # --- Model client (OpenAI-compatible Ollama API) ---
+        # --- Model clients ---
+        # Sync client only used for the initial .models.list() probe.
         self.client = OpenAI(base_url=model_url, api_key="ollama")
+        # Async client for generation — true cancellation support so we can
+        # interrupt an in-flight LLM call when a new player utterance arrives.
+        self._async_client = AsyncOpenAI(base_url=model_url, api_key="ollama")
 
         # --- VRChat OSC ---
         self.osc = VRChatOSCClient(
@@ -96,7 +204,6 @@ class AgentController:
         self.look_tool = LookTool(self.osc)
         self.memory_tool = MemoryTool()
         self.chatbox_tool = ChatboxTool(self.osc)  # NO speak_tool coupling
-        self.world_tool = WorldTool()
 
         self._tool_handlers = {
             "speak": self.speak_tool.speak,
@@ -108,7 +215,6 @@ class AgentController:
             "memory_write": self.memory_tool.memory_write,
             "memory_read": self.memory_tool.memory_read,
             "send_chatbox": self.chatbox_tool.send_chatbox,
-            "join_world": self.world_tool.join_world,
         }
 
         # --- State & memory ---
@@ -131,6 +237,15 @@ class AgentController:
         self._last_act_time: float = time.time()
         self._last_perception_log: float = 0.0
 
+        # In-flight generation tracking — for interruptible responses.
+        # When a new player utterance arrives while we're generating:
+        #   1. cancel the current task (kills the HTTP request)
+        #   2. bump the id (so any late-completing response is discarded)
+        #   3. cancel TTS if playing
+        # Then a fresh _act runs with both utterances in dialogue.
+        self._gen_id: int = 0
+        self._gen_task: Optional[asyncio.Task] = None
+
     def _collect_tool_schemas(self) -> list[dict]:
         return [
             self.speak_tool.tool_schema,
@@ -141,7 +256,6 @@ class AgentController:
             self.memory_tool.tool_schema_write,
             self.memory_tool.tool_schema_read,
             self.chatbox_tool.tool_schema,
-            self.world_tool.tool_schema,
             {
                 "name": "jump",
                 "description": "Make the avatar jump.",
@@ -199,6 +313,9 @@ class AgentController:
     def shutdown(self) -> None:
         logger.info("Shutting down agent...")
         self._running = False
+        # Cancel any in-flight generation
+        if self._gen_task and not self._gen_task.done():
+            self._gen_task.cancel()
         try:
             self.scene_analyzer.stop()
             self.audio_capture.stop()
@@ -227,24 +344,28 @@ class AgentController:
         snap = self.signals.snapshot()
         speech = snap.latest_speech
 
-        # 2. Barge-in: if a new speech chunk arrived while TTS was active,
-        #    cancel the current playback so Chati listens instead of rambling.
-        if speech and snap.tts_playing:
-            logger.info(f'[BARGE-IN] Player spoke during TTS: "{speech[:50]}"')
-            self.tts_router.cancel()
-
-        # 3. Append player speech to dialogue
+        # 2. New speech = INTERRUPT everything pending
         if speech:
+            # (a) Stop any TTS currently playing
+            if snap.tts_playing:
+                logger.info(f'[BARGE-IN] Player spoke during TTS: "{speech[:50]}"')
+                self.tts_router.cancel()
+            # (b) Cancel any in-flight LLM generation + mark its response stale
+            self._gen_id += 1
+            if self._gen_task and not self._gen_task.done():
+                logger.info("[INTERRUPT] cancelling in-flight generation")
+                self._gen_task.cancel()
+            # (c) Append to dialogue IMMEDIATELY so the next generation sees it
             self.dialogue.add_player(speech)
 
-        # 4. Update state machine with hysteresis
+        # 3. Update state machine with hysteresis
         state = self.state_machine.update(
             players_visible=snap.perception.players_visible,
             speech_heard=bool(speech),
             tick_seconds=HEARTBEAT_INTERVAL,
         )
 
-        # 5. Explicit follow/stop commands handled cheaply (no LLM)
+        # 4. Explicit follow/stop commands handled cheaply (no LLM)
         if speech:
             lower = speech.lower()
             if any(p in lower for p in ["follow me", "come with me", "come here"]):
@@ -252,20 +373,38 @@ class AgentController:
             elif any(p in lower for p in ["stop following", "stop follow", "stay here"]):
                 self.state_machine.force_stop_follow()
 
-        # 6. Periodic perception log
+            # Spatial cues → immediate physical reaction before LLM thinks
+            for cue, turn_args in _TURN_CUES.items():
+                if cue in lower and turn_args:
+                    direction, amount = turn_args
+                    logger.info(f"[CUE] '{cue}' -> turn {direction} {amount}")
+                    try:
+                        self.look_tool.turn(direction=direction, amount=amount)
+                    except Exception as e:
+                        logger.warning(f"Cue turn failed: {e}")
+                    break
+
+        # 5. Periodic perception log
         now = snap.timestamp
         if now - self._last_perception_log > 10.0:
             logger.info(f"[{state.name}] {snap.perception.summary()}")
             self._last_perception_log = now
+
+        # 6. Don't double-schedule: if a generation is already running
+        #    and this tick has no speech, skip.
+        if self._gen_task and not self._gen_task.done() and not speech:
+            return
 
         # 7. Decide if we should act
         reason = self._should_act(state, speech, now)
         if not reason:
             return
 
-        # 8. Single-path LLM call using the same snapshot
+        # 8. Schedule _act as a cancellable task — does NOT block the loop.
         self._last_act_time = now
-        await self._act(reason, state, speech, snap)
+        self._gen_task = asyncio.create_task(
+            self._act(reason, state, speech, snap, self._gen_id)
+        )
 
     def _should_act(self, state: AgentState, speech: str, now: float) -> Optional[str]:
         """Return a reason string if we should call the LLM, else None."""
@@ -300,12 +439,20 @@ class AgentController:
     # Single action path
     # ================================================================
 
-    async def _act(self, reason: str, state: AgentState, speech: str, snap: SignalsSnapshot) -> None:
-        """Single LLM call — one prompt, one response, one set of tool calls.
+    async def _act(
+        self,
+        reason: str,
+        state: AgentState,
+        speech: str,
+        snap: SignalsSnapshot,
+        gen_id: int,
+    ) -> None:
+        """Interruptible LLM call — cancelled via asyncio if new speech arrives.
 
-        Takes a SignalsSnapshot taken at the start of this tick, so the LLM
-        reasons over a consistent view — not a racy mix of stale perception
-        and fresh audio (Phase 3, AUDIT.md item 10).
+        Runs as a Task spawned by _tick. If cancelled mid-flight, the HTTP
+        request to Ollama is aborted. Even if it completes, we double-check
+        gen_id matches the current one — otherwise the response is stale
+        (a newer utterance replaced it) and gets discarded.
         """
         frame_b64 = snap.frame_b64
         perception_text = snap.perception.for_prompt() if snap.perception else ""
@@ -320,10 +467,8 @@ class AgentController:
             dialogue_text=dialogue_text,
         )
 
-        # Per-reason trigger text injected as the user message
         trigger = self._reason_to_trigger(reason, state, speech)
 
-        # Build a FLAT message list — no image history across turns
         content_parts = []
         if frame_b64:
             content_parts.append({
@@ -337,25 +482,40 @@ class AgentController:
             {"role": "user", "content": content_parts},
         ]
 
-        logger.info(f"[{state.name}] act({reason}): system={len(system_prompt)}ch dialogue={len(self.dialogue)}t")
+        logger.info(
+            f"[{state.name}] act({reason}) gen#{gen_id}: "
+            f"system={len(system_prompt)}ch dialogue={len(self.dialogue)}t"
+        )
 
         # Mute audio capture BEFORE the model call (audit 3.5)
         self.audio_capture.muted = True
 
         t_start = time.time()
         try:
-            response = self.client.chat.completions.create(
+            response = await self._async_client.chat.completions.create(
                 model=self.model_name,
                 messages=messages,
                 tools=self._tool_definitions,
                 tool_choice="auto",
                 temperature=1.0,
                 top_p=0.95,
-                max_tokens=256,
+                max_tokens=512,
             )
+        except asyncio.CancelledError:
+            logger.info(f"  [CANCELLED] gen#{gen_id} aborted by interruption")
+            self.audio_capture.muted = False
+            raise
         except Exception as e:
             logger.error(f"Model call failed: {e}")
             self.audio_capture.muted = False
+            return
+
+        # Unmute now — response is in hand
+        self.audio_capture.muted = False
+
+        # Staleness check: did a newer generation bump the id while we were waiting?
+        if gen_id != self._gen_id:
+            logger.info(f"  [STALE] gen#{gen_id} discarded (current is #{self._gen_id})")
             return
 
         elapsed = time.time() - t_start
@@ -364,7 +524,6 @@ class AgentController:
         # Track what Chati said for dialogue continuity
         spoken_text = self._handle_response(msg)
 
-        # Record Chati's turn in dialogue buffer
         if spoken_text:
             self.dialogue.add_chati(spoken_text)
 
@@ -375,49 +534,128 @@ class AgentController:
                 f"{usage.completion_tokens} out"
             )
 
-        # Unmute AFTER the model call (TTS inside handlers manages its own mute via PTT)
-        self.audio_capture.muted = False
-
     def _reason_to_trigger(self, reason: str, state: AgentState, speech: str) -> str:
-        """Convert a 'reason' code into a short user-facing trigger line."""
+        """Convert a 'reason' code into a short user-facing trigger line.
+
+        Note: we only get reliable signal for *sight* (YOLO/OCR) and for
+        *direct speech aimed at Chati* (Whisper STT). We have no idea
+        what ambient conversations are happening around her. So triggers
+        must avoid phrases like "it's quiet" that Chati would parrot.
+        """
         if reason == "they_spoke":
-            return f'They said: "{speech}"\n\nReply naturally — one chatbox message, gesture if it fits.'
+            return (
+                f'Someone said to you: "{speech}"\n\n'
+                "Reply to THEM. Say what you actually think — brief if it's "
+                "a quick back-and-forth, longer if you have a real thought. "
+                "Use a gesture if it fits. Don't change the subject."
+            )
         if reason == "just_arrived":
-            return "You just noticed someone. Say hi — react to their avatar or the vibe. One chatbox message."
+            return (
+                "You just noticed someone. React to what they actually look "
+                "like or what's happening on screen. Be specific — no generic "
+                "openers. Say as much or as little as feels natural."
+            )
         if reason == "lull":
-            return "It's been quiet for a while. Say something to break the silence, or do a small gesture."
+            return (
+                "No one has said anything to you in a while. React to "
+                "something you SEE, or share a passing thought — the kind "
+                "an older entity stuck in here might have. Don't comment "
+                "on noise level or ask 'is anyone there'."
+            )
         if reason == "following_tick":
-            return "You're following them. Keep close — move forward if they're far, turn if they're to the side."
+            return (
+                "You're following them. Move forward if they're far, "
+                "turn toward them if they're to the side."
+            )
         if reason == "idle":
-            return "Nobody around. Wander or look at something interesting. Maybe turn to explore a new direction."
+            return (
+                "Nothing's grabbing your attention right now. Wander, "
+                "look somewhere new, or gesture. Don't narrate."
+            )
         return "React to what's happening."
 
     def _handle_response(self, msg) -> str:
-        """Execute tool calls; return any spoken/chatbox text for dialogue log.
+        """Execute tool calls; return spoken text for dialogue log.
 
-        Plain text content is ignored (per the new flow, Chati should use
-        send_chatbox tool to talk — raw content responses are treated as
-        dialogue candidates for the buffer only).
+        Handles THREE cases:
+          1. Proper OpenAI tool_calls array (preferred)
+          2. Pseudo-tool-calls embedded in content (Gemma quirk) — parsed
+             and executed as real calls instead of spoken aloud
+          3. Plain conversational text with no tool syntax — sent as chatbox
         """
-        spoken_pieces = []
+        spoken_pieces: list[str] = []
+        content = (msg.content or "").strip()
 
-        # Plain content fallback — if model returned text without a tool, still say it
-        if msg.content and msg.content.strip():
-            text = msg.content.strip()
-            logger.info(f"  [TEXT] {text}")
-            spoken_pieces.append(text)
-            # Actually speak + chatbox it
-            self.chatbox_tool.send_chatbox(text[:144])
-            self.speak_tool.speak(text)
-
-        # Execute tool calls
+        # --- 1. Proper tool calls from OpenAI API ---
         if msg.tool_calls:
             for tc in msg.tool_calls:
                 spoken = self._execute_tool_call(tc)
                 if spoken:
                     spoken_pieces.append(spoken)
 
+        # --- 2. Pseudo-tool-calls hiding inside content ---
+        if content:
+            pseudo_calls, leftover = _extract_pseudo_calls(content)
+            if pseudo_calls:
+                for pc in pseudo_calls:
+                    spoken = self._run_pseudo_call(pc)
+                    if spoken:
+                        spoken_pieces.append(spoken)
+                content = leftover  # what's left after pulling out tool syntax
+
+            # --- 3. Plain conversational text — speak as chatbox ---
+            if content:
+                # Sanity: skip if it's just punctuation or a stray quote
+                if len(content.strip("\"'` {}<>|")) > 1:
+                    logger.info(f"  [TEXT] {content[:100]}")
+                    # chatbox truncates to 144 chars; speak gets the full text
+                    self.chatbox_tool.send_chatbox(content)
+                    tts_text = _strip_emojis(content)
+                    if tts_text:
+                        self.speak_tool.speak(tts_text)
+                    spoken_pieces.append(content)
+
         return " ".join(spoken_pieces).strip()
+
+    def _run_pseudo_call(self, pc: dict) -> str:
+        """Execute a pseudo-tool-call extracted from text content.
+
+        pc has keys: name, arg_key, arg_value.
+        Returns the spoken text if this was a chatbox/speak call, else "".
+        """
+        name = pc["name"]
+        arg_key = pc["arg_key"]
+        arg_value = pc["arg_value"]
+
+        # Skip empty args (malformed / truncated output)
+        if not arg_value:
+            logger.debug(f"  [SKIP pseudo] {name}(empty)")
+            return ""
+
+        handler = self._tool_handlers.get(name)
+        if not handler:
+            logger.warning(f"  [pseudo] unknown tool: {name}")
+            return ""
+
+        args = {arg_key: arg_value}
+        logger.info(f"  [PSEUDO] {name}({arg_key}={arg_value!r})")
+
+        try:
+            handler(**args)
+        except Exception as e:
+            logger.error(f"  [pseudo] {name} failed: {e}")
+            return ""
+
+        spoken_text = ""
+        if name == "send_chatbox":
+            spoken_text = arg_value
+            tts_text = _strip_emojis(arg_value)
+            if tts_text:
+                self.speak_tool.speak(tts_text)
+        elif name == "speak":
+            spoken_text = arg_value
+
+        return spoken_text
 
     def _execute_tool_call(self, tool_call) -> str:
         """Execute one tool call. Returns text (for dialogue log) if it was a chatbox/speak."""
@@ -427,6 +665,14 @@ class AgentController:
         except json.JSONDecodeError:
             logger.error(f"Bad tool args: {tool_call.function.arguments}")
             return ""
+
+        # Skip no-op tool calls (model sometimes emits empty chatbox)
+        if name == "send_chatbox":
+            text = (args.get("text") or "").strip()
+            if not text:
+                logger.debug("  [SKIP] empty send_chatbox")
+                return ""
+            args["text"] = text
 
         handler = self._tool_handlers.get(name)
         if not handler:
@@ -441,13 +687,15 @@ class AgentController:
             logger.error(f"Tool failed {name}: {e}")
             return ""
 
-        # If the tool sent a chatbox message, ALSO speak it (owner = controller).
-        # We do this here instead of coupling inside chatbox.py (audit 1.7).
+        # Controller owns "say this out loud" (audit 1.7 — no hidden coupling)
         spoken_text = ""
         if name == "send_chatbox":
-            spoken_text = args.get("text", "")
-            if spoken_text:
-                self.speak_tool.speak(spoken_text)
+            raw_text = args.get("text", "")
+            spoken_text = raw_text
+            # Strip emojis for TTS but keep the raw text for the dialogue log
+            tts_text = _strip_emojis(raw_text)
+            if tts_text:
+                self.speak_tool.speak(tts_text)
         elif name == "speak":
             spoken_text = args.get("text", "")
 

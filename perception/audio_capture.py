@@ -47,6 +47,12 @@ MIN_WORD_COUNT = 2
 # mid-sentence without the agent hearing its own TTS feedback.
 BARGE_IN_THRESHOLD_MULTIPLIER = 4.0
 
+# Force transcription after this many seconds of continuous speech.
+# Critical for crowded lobbies where background chatter never dips
+# below the silence threshold — otherwise the buffer grows forever
+# and nothing ever gets transcribed.
+MAX_UTTERANCE_SECONDS = 6.0
+
 
 class AudioCaptureProcessor:
     """Captures VRChat audio and transcribes speech with Whisper.
@@ -76,6 +82,7 @@ class AudioCaptureProcessor:
         self._is_speaking = False
         self._speech_buffer: list[np.ndarray] = []
         self._silence_start: float = 0.0
+        self._speech_start: float = 0.0   # when current utterance began
         self._last_transcription_time: float = 0.0
 
         self._running = False
@@ -211,9 +218,20 @@ class AudioCaptureProcessor:
                     if energy > threshold:
                         if not self._is_speaking:
                             self._is_speaking = True
+                            self._speech_start = time.time()
                             logger.info(f"* Speech detected (energy={energy:.3f})")
                         self._speech_buffer.append(mono)
                         self._silence_start = 0.0
+
+                        # Force transcribe if the utterance has been
+                        # going non-stop too long (e.g. noisy lobby).
+                        if time.time() - self._speech_start > MAX_UTTERANCE_SECONDS:
+                            logger.info("* Max utterance length reached — forcing transcribe")
+                            self._transcribe_speech(native_rate)
+                            self._is_speaking = False
+                            self._speech_buffer.clear()
+                            self._silence_start = 0.0
+                            self._speech_start = 0.0
                     elif self._is_speaking:
                         if self._silence_start == 0.0:
                             self._silence_start = time.time()
@@ -224,6 +242,7 @@ class AudioCaptureProcessor:
                             self._is_speaking = False
                             self._speech_buffer.clear()
                             self._silence_start = 0.0
+                            self._speech_start = 0.0
 
                 except IOError as e:
                     logger.warning(f"Audio read warning: {e}")

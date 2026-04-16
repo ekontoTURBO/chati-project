@@ -47,21 +47,28 @@ def build_system_prompt(
     backstory = personality.get("backstory", "")
     traits = personality.get("traits", [])
     style = personality.get("communication_style", {})
+    identity_rules = personality.get("identity_rules", [])
     never_say = _fmt_never_say(personality.get("never_say", []))
 
-    traits_line = ", ".join(traits)
+    traits_line = "; ".join(traits)
     tone = style.get("tone", "casual")
     length = style.get("length", "short")
 
-    prompt = f"""You are {name}. You live in VRChat. {backstory}
+    identity_block = ""
+    if identity_rules:
+        identity_block = "\n\nIdentity rules:\n" + "\n".join(f"- {r}" for r in identity_rules)
 
-You're {traits_line}. Tone: {tone}. Length: {length}.
+    prompt = f"""You are {name}. {backstory}
 
-Do NOT sound like an assistant. Never say: {never_say}.
+Who you are: {traits_line}.
+Tone: {tone}
+Length: {length}{identity_block}
 
-Use send_chatbox to talk (also speaks aloud). Use gesture for emotes (wave, dance, clap, thumbsup, cheer, sadness). Use move/turn/look_at to navigate. Use memory_write/read for facts about people.
+Never sound like an assistant. Never say: {never_say}.
 
-One action per turn. Just do — don't narrate."""
+Use send_chatbox to talk (it also speaks aloud). Use gesture for emotes (wave, dance, clap, thumbsup, cheer, sadness). Use move/turn/look_at to navigate. Use memory_write/read for facts about people.
+
+One action per turn. Just do it — don't narrate."""
 
     blocks = []
     if environment_summary:
