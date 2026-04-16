@@ -24,13 +24,13 @@ Chati can see players (any avatar type), read chatbox messages, hear and underst
               |                              |
               v                              v
 +================================================================+
-|  STATE MACHINE           |  REASONING (Gemma 4 via Ollama)      |
+|  STATE MACHINE           |  3-TIER RESPONSE SYSTEM              |
 |                          |                                      |
-|  IDLE -> EXPLORING       |  Human-like personality              |
-|       -> APPROACHING     |  Emotional reactions                 |
-|       -> SOCIALIZING     |  Context-aware decisions             |
-|       -> CONVERSING      |  Voice commands (follow me, stop)    |
-|       -> FOLLOWING       |                                      |
+|  IDLE -> EXPLORING       |  Tier 1: Intent matcher (<1ms)       |
+|       -> APPROACHING     |  Tier 2: Qwen 3.5 2B (~400ms)        |
+|       -> SOCIALIZING     |  Tier 3: Gemma 4 E2B vision (3-10s)  |
+|       -> CONVERSING      |                                      |
+|       -> FOLLOWING       |  Spatial memory + stereo DOA         |
 +================================================================+
               |
               v
@@ -45,10 +45,15 @@ Chati can see players (any avatar type), read chatbox messages, hear and underst
 ## How It Works
 
 1. **Real-Time Vision** (3 FPS): YOLO11 detects objects, motion detection finds player avatars of ANY type (anime, furry, robot — anything that moves), EasyOCR reads chatbox text, frame differencing detects scene changes.
-2. **Hearing** (Whisper STT): Captures audio from your speakers via WASAPI loopback, detects speech boundaries, transcribes with faster-whisper. Recognizes voice commands like "follow me" and "stop."
-3. **Voice Output** (Piper TTS): Generates speech, plays to VB-Audio Cable with automatic push-to-talk via OSC. Players hear Chati speak.
-4. **State Machine**: Drives behavior — EXPLORING when alone, APPROACHING when spotting someone, SOCIALIZING after greeting, CONVERSING when speech is detected, FOLLOWING when asked.
-5. **Personality**: Human-like reactions — gets excited about cool things, overwhelmed in crowds, bored when alone, admits confusion. Never sounds like a customer service bot.
+2. **Hearing** (Whisper STT + Stereo DOA): Captures audio from your speakers via WASAPI loopback, transcribes with faster-whisper. Analyzes L/R channel balance to detect **where sounds come from** (left/center/right).
+3. **Voice Output** (Piper TTS): Generates speech, plays to VB-Audio Cable with automatic push-to-talk via OSC.
+4. **3-Tier Response System**:
+   - **Tier 1 (instant)**: Regex-based intent matcher catches direct commands ("follow me", "stop", "turn left") — executes in <1ms, no LLM
+   - **Tier 2 (~400ms)**: Qwen 3.5 2B for fast text-only chat responses
+   - **Tier 3 (3-10s)**: Gemma 4 E2B for vision-heavy reasoning (describing scenes, reading avatars)
+5. **State Machine**: EXPLORING → APPROACHING → SOCIALIZING → CONVERSING → FOLLOWING
+6. **Spatial Memory**: Tracks player positions and sound directions over 10 seconds — "the player was on my left 3 seconds ago"
+7. **Personality**: Human-like reactions — gets excited, overwhelmed in crowds, admits confusion. Never sounds like an AI assistant.
 
 ## Requirements
 
@@ -100,6 +105,8 @@ pip install -r requirements.txt
 ```bash
 cd /mnt/c/Users/YOUR_USERNAME/Desktop/chati-project/model_server
 bash setup_wsl.sh
+# Also pull the fast model for Tier 2 (recommended):
+ollama pull qwen3.5:2b
 ```
 
 ### Step 3: Piper voice model

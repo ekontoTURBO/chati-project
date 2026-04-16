@@ -15,6 +15,8 @@ This document describes the full architecture of Chati, a local AI companion for
 - [Data Flow](#data-flow)
 - [Voice Output Pipeline](#voice-output-pipeline)
 - [Following System](#following-system)
+- [3-Tier Response System](#3-tier-response-system)
+- [Spatial Awareness](#spatial-awareness)
 - [Personality System](#personality-system)
 - [Technology Choices](#technology-choices)
 
@@ -353,6 +355,88 @@ Player position on screen → Movement decision:
 
 ### Motion Detection During Following
 Motion-based player detection is suppressed while Chati is moving (to avoid detecting its own camera movement as players). YOLO person detection remains active as a fallback.
+
+---
+
+## 3-Tier Response System
+
+Voice inputs are routed through three progressively smarter and slower tiers. Each tier handles what it can; if it can't, the request falls through to the next.
+
+### Tier 1: Intent Matcher (agent/intent_matcher.py)
+- **Speed**: <1ms
+- **Tech**: Regex pattern matching
+- **Handles**: Direct, unambiguous commands
+  - Follow: "follow me", "come here", "this way"
+  - Stop: "stop", "wait here", "stay here"
+  - Turn: "turn left/right/around"
+  - Move: "go forward", "step back"
+  - Jump, gestures (wave, dance, cheer)
+- **Output**: Executes tool calls directly, sets state if needed. No LLM involved.
+
+### Tier 2: Fast Text Model (agent/fast_model.py)
+- **Speed**: ~400ms
+- **Model**: Qwen 3.5 2B Instruct via Ollama
+- **Handles**: Short conversational replies, tool calls that don't need vision
+- **Skipped when**: Speech contains vision keywords ("see", "look", "avatar")
+
+### Tier 3: Vision Model (Gemma 4 E2B)
+- **Speed**: 3-10s
+- **Handles**: Anything requiring visual understanding
+  - Scene description
+  - Avatar commentary
+  - Reading chatbox text that OCR missed
+  - Exploring new environments
+
+### Routing Logic
+
+```
+Speech transcribed by Whisper
+    ↓
+Tier 1: Does this match a command pattern?
+    ├── YES → Execute tool call directly, return
+    └── NO ↓
+         Does speech need vision? (check keywords)
+         ├── NO + fast model available → Tier 2 (Qwen)
+         └── YES or no fast model → Tier 3 (Gemma 4)
+```
+
+### Why This Works
+
+Most voice interactions are short commands or quick chat — both handled by Tiers 1-2 in under 500ms. Vision is reserved for when it's actually needed, cutting average response time by 3-5x.
+
+---
+
+## Spatial Awareness
+
+### Stereo Direction-of-Arrival (DOA)
+VRChat spatializes audio based on player positions — players to your left are louder in the left channel. The agent extracts this:
+
+```
+L_rms, R_rms = stereo energy
+direction = (R_rms - L_rms) / (L_rms + R_rms)
+# -1 = fully left, 0 = center, +1 = fully right
+```
+
+Each transcribed utterance is tagged with its direction.
+
+### Spatial Memory (perception/spatial_memory.py)
+A 10-second rolling window tracks:
+- **Player sightings**: (x, y) positions of detected players with timestamps
+- **Sound events**: Speech with direction-of-arrival
+
+Queries:
+- `last_player_position()` — most recent player sighting
+- `recent_sound_direction(within_seconds)` — where was the last voice
+- `get_approach_direction()` — which way to turn to face the target
+- `describe_context()` — human-readable summary for LLM prompts
+
+### Smart Movement: approach()
+New tool that combines spatial memory with movement:
+1. Check spatial memory for player/sound direction
+2. Turn to face that direction
+3. Walk forward toward the target
+
+Used for "come here" commands — Chati turns toward where you spoke from, then walks.
 
 ---
 

@@ -23,11 +23,24 @@ logger = logging.getLogger("perception.audio")
 # Duration of each audio chunk in seconds
 CHUNK_DURATION = 2.0
 
-# Minimum audio energy to consider a chunk as containing speech
-SILENCE_THRESHOLD = 0.005
+# Minimum audio energy to consider speech (higher = only nearby/loud voices)
+# 0.005 = hears everything, 0.03 = only nearby players, 0.06 = only close & loud
+SILENCE_THRESHOLD = 0.03
 
 # Seconds of silence after speech to consider utterance complete
 SILENCE_AFTER_SPEECH = 1.5
+
+# Minimum speech duration (seconds) to bother transcribing
+# Filters out background snippets and noise bursts
+MIN_SPEECH_DURATION = 1.0
+
+# Cooldown after transcription — ignore audio for this long
+# Prevents rapid-fire transcription in noisy lobbies
+TRANSCRIPTION_COOLDOWN = 3.0
+
+# Minimum word count to accept a transcription
+# "You" or "The" alone is probably background noise
+MIN_WORD_COUNT = 2
 
 
 class AudioCaptureProcessor:
@@ -57,7 +70,10 @@ class AudioCaptureProcessor:
         # Speech state tracking
         self._is_speaking = False
         self._speech_buffer: list[np.ndarray] = []
+        # Stereo buffer — used for direction-of-arrival (DOA) computation
+        self._stereo_buffer: list[np.ndarray] = []
         self._silence_start: float = 0.0
+        self._last_transcription_time: float = 0.0
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -168,36 +184,43 @@ class AudioCaptureProcessor:
                         int(native_rate * 0.1),
                         exception_on_overflow=False,
                     )
-                    audio = np.frombuffer(data, dtype=np.float32)
-                    if channels > 1:
-                        audio = audio.reshape(-1, channels).mean(axis=1)
+                    raw = np.frombuffer(data, dtype=np.float32)
 
-                    # Skip if muted (TTS is playing)
+                    # Keep stereo for DOA, produce mono for Whisper
+                    if channels > 1:
+                        stereo = raw.reshape(-1, channels)
+                        mono = stereo.mean(axis=1)
+                    else:
+                        stereo = np.column_stack([raw, raw])
+                        mono = raw
+
+                    # Skip if muted (TTS playing) or in cooldown
                     if self.muted:
                         continue
+                    if time.time() - self._last_transcription_time < TRANSCRIPTION_COOLDOWN:
+                        continue
 
-                    # Check energy
-                    energy = np.sqrt(np.mean(audio ** 2))
+                    # Check energy — only react to nearby/loud voices
+                    energy = np.sqrt(np.mean(mono ** 2))
 
                     if energy > SILENCE_THRESHOLD:
-                        # Speech detected
                         if not self._is_speaking:
                             self._is_speaking = True
-                            logger.info("* Speech detected")
-                        self._speech_buffer.append(audio)
+                            logger.info(f"* Speech detected (energy={energy:.3f})")
+                        self._speech_buffer.append(mono)
+                        self._stereo_buffer.append(stereo)
                         self._silence_start = 0.0
                     elif self._is_speaking:
-                        # Silence after speech
                         if self._silence_start == 0.0:
                             self._silence_start = time.time()
-                        self._speech_buffer.append(audio)
+                        self._speech_buffer.append(mono)
+                        self._stereo_buffer.append(stereo)
 
-                        # Check if silence duration exceeded threshold
                         if time.time() - self._silence_start > SILENCE_AFTER_SPEECH:
-                            # Utterance complete — transcribe it
                             self._transcribe_speech(native_rate)
                             self._is_speaking = False
                             self._speech_buffer.clear()
+                            self._stereo_buffer.clear()
                             self._silence_start = 0.0
 
                 except IOError as e:
@@ -206,23 +229,51 @@ class AudioCaptureProcessor:
         except Exception as e:
             logger.error(f"Audio capture error: {e}")
 
+    def _compute_direction(self) -> float:
+        """Compute direction-of-arrival from stereo buffer.
+
+        Returns:
+            Pan value in [-1, 1]:
+            -1 = fully left, 0 = center, 1 = fully right
+        """
+        if not self._stereo_buffer:
+            return 0.0
+        stereo = np.concatenate(self._stereo_buffer, axis=0)
+        if stereo.ndim < 2 or stereo.shape[1] < 2:
+            return 0.0
+        left_rms = float(np.sqrt(np.mean(stereo[:, 0] ** 2)))
+        right_rms = float(np.sqrt(np.mean(stereo[:, 1] ** 2)))
+        total = left_rms + right_rms
+        if total < 1e-6:
+            return 0.0
+        # Pan: -1=left, +1=right
+        return (right_rms - left_rms) / total
+
     def _transcribe_speech(self, native_rate: int) -> None:
-        """Transcribe accumulated speech buffer with Whisper."""
+        """Transcribe accumulated speech buffer with Whisper.
+
+        Applies filters to avoid transcribing background noise:
+        - Minimum duration (skip short bursts)
+        - Minimum word count (skip single-word noise)
+        - Cooldown between transcriptions
+        """
         if not self._speech_buffer or not self._whisper:
             return
 
-        # Concatenate all speech audio
+        # Compute direction before consuming the stereo buffer
+        direction = self._compute_direction()
+
         speech = np.concatenate(self._speech_buffer)
 
-        # Resample to 16kHz if needed (Whisper expects 16kHz)
+        # Resample to 16kHz (Whisper expects 16kHz)
         if native_rate != 16000:
             num_samples = int(len(speech) * 16000 / native_rate)
             indices = np.linspace(0, len(speech) - 1, num_samples)
             speech = np.interp(indices, np.arange(len(speech)), speech).astype(np.float32)
 
         duration = len(speech) / 16000
-        if duration < 0.5:
-            # Too short to be meaningful speech
+        if duration < MIN_SPEECH_DURATION:
+            logger.debug(f"* Speech too short ({duration:.1f}s), skipping")
             return
 
         logger.info(f"* Transcribing {duration:.1f}s of speech...")
@@ -236,15 +287,41 @@ class AudioCaptureProcessor:
             )
             text = " ".join(seg.text.strip() for seg in segments).strip()
 
-            if text and len(text) > 1:
-                logger.info(f"* Heard: \"{text}\"")
-                self._chunk_queue.put({
-                    "text": text,
-                    "duration": duration,
-                    "timestamp": time.time(),
-                })
-            else:
+            # Filter out background noise transcriptions
+            if not text:
                 logger.debug("* Transcription empty, skipping")
+                return
+
+            word_count = len(text.split())
+            if word_count < MIN_WORD_COUNT:
+                logger.debug(f'* Too few words ({word_count}): "{text}", skipping')
+                return
+
+            # Filter common Whisper hallucinations on noise
+            noise_phrases = {
+                "thank you", "thanks for watching", "subscribe",
+                "you", "the", "hmm", "uh", "um", "...",
+            }
+            if text.lower().strip(".,!? ") in noise_phrases:
+                logger.debug(f'* Noise hallucination: "{text}", skipping')
+                return
+
+            logger.info(f'* Heard: "{text}"')
+            self._last_transcription_time = time.time()
+
+            # Clear old queued transcriptions — only keep the latest
+            while not self._chunk_queue.empty():
+                try:
+                    self._chunk_queue.get_nowait()
+                except:
+                    break
+
+            self._chunk_queue.put({
+                "text": text,
+                "duration": duration,
+                "direction": direction,  # -1=left, 0=center, 1=right
+                "timestamp": time.time(),
+            })
 
         except Exception as e:
             logger.error(f"Whisper transcription error: {e}")

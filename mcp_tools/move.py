@@ -111,6 +111,43 @@ class MoveTool:
             logger.error(f"Jump failed: {e}")
             return {"success": False, "error": str(e)}
 
+    def approach(self, look_tool=None, spatial_memory=None) -> dict:
+        """Approach the last known player/sound position.
+
+        Uses spatial memory to determine which direction to face,
+        then walks forward. Multi-step smart movement.
+
+        Args:
+            look_tool: LookTool for turning (optional)
+            spatial_memory: SpatialMemory for direction lookup (optional)
+
+        Returns:
+            Status dict
+        """
+        if spatial_memory is None:
+            # Fallback: just walk forward
+            logger.info("Approach: no spatial memory, walking forward")
+            return self.move(direction="forward", speed=0.8, duration=1.5)
+
+        direction = spatial_memory.get_approach_direction()
+        if direction is None:
+            logger.info("Approach: no known target, looking around")
+            if look_tool:
+                look_tool.turn(direction="right", amount="quarter")
+            return {"success": True, "action": "searching"}
+
+        logger.info(f"Approach: target direction = {direction}")
+
+        if direction == "left" and look_tool:
+            look_tool.turn(direction="left", amount="quarter")
+            time.sleep(0.2)
+        elif direction == "right" and look_tool:
+            look_tool.turn(direction="right", amount="quarter")
+            time.sleep(0.2)
+
+        # Walk forward regardless (after turning if needed)
+        return self.move(direction="forward", speed=0.9, duration=2.0)
+
     @property
     def tool_schema(self) -> dict:
         """MCP tool definition for function calling."""

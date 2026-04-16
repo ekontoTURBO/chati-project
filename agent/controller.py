@@ -45,7 +45,10 @@ from mcp_tools.chatbox import ChatboxTool
 from mcp_tools.world import WorldTool
 from agent.prompts import load_personality, build_system_prompt, build_tool_definitions
 from agent.state_machine import AgentStateMachine, AgentState
+from agent.intent_matcher import match_intent, needs_vision
+from agent.fast_model import FastModel
 from perception.scene_analyzer import SceneAnalyzer
+from perception.spatial_memory import SpatialMemory
 
 logger = logging.getLogger("agent.controller")
 
@@ -145,9 +148,12 @@ class AgentController:
         # Tool definitions in OpenAI format
         self._tool_definitions = build_tool_definitions(self._tool_schemas)
 
-        # --- New: Scene analyzer + State machine ---
+        # --- Perception & reasoning ---
         self.scene_analyzer = SceneAnalyzer(self.video_capture)
         self.state_machine = AgentStateMachine()
+        self.spatial_memory = SpatialMemory(window_seconds=10.0)
+        # Tier 2 fast model (probed on startup)
+        self.fast_model = FastModel(base_url=model_url)
 
         # Flag to control the main loop
         self._running = False
@@ -219,10 +225,20 @@ class AgentController:
             models = self.client.models.list()
             logger.info(f"Ollama server OK. Available models: {[m.id for m in models.data]}")
         except Exception as e:
-            logger.error(f"Cannot reach vLLM server: {e}")
-            logger.error("Make sure the vLLM Docker container is running: docker start chati-vllm")
+            logger.error(f"Cannot reach Ollama server: {e}")
+            logger.error("Make sure Ollama is running: ollama serve")
             self.shutdown()
             return
+
+        # Probe for fast model (Tier 2) — optional
+        fast_tag = self.fast_model.probe()
+        if fast_tag:
+            logger.info(f"Tier 2 fast model ready: {fast_tag}")
+        else:
+            logger.warning(
+                "Tier 2 fast model not available — falling back to Gemma 4 for all LLM calls. "
+                "Pull one with: ollama pull qwen3.5:2b (in WSL)"
+            )
 
         # Handle graceful shutdown
         signal.signal(signal.SIGINT, lambda s, f: self.shutdown())
@@ -253,10 +269,20 @@ class AgentController:
                 perception = self.scene_analyzer.get_state()
                 audio_chunks = self.audio_capture.get_all_chunks()
                 speech = None
+                speech_dict = None
                 if audio_chunks:
                     speech = " ".join(c["text"] for c in audio_chunks).strip()
+                    # Preserve direction from the latest chunk
+                    direction = audio_chunks[-1].get("direction", 0.0)
                     if speech:
-                        logger.info(f'* Heard: "{speech}"')
+                        side = "left" if direction < -0.2 else ("right" if direction > 0.2 else "center")
+                        logger.info(f'* Heard ({side}): "{speech}"')
+                        speech_dict = {"text": speech, "direction": direction}
+
+                # --- Update spatial memory with player sightings ---
+                if perception.player_positions:
+                    for x, y in perception.player_positions[:1]:
+                        self.spatial_memory.add_player_sighting(x, y)
 
                 # --- 2. Update state machine ---
                 state = self.state_machine.update(
@@ -277,7 +303,7 @@ class AgentController:
 
                 # Always act immediately for speech
                 if speech:
-                    await self._handle_conversation(speech, perception)
+                    await self._handle_conversation(speech_dict or speech, perception)
                 elif now - self._last_llm_action >= interval:
                     self._last_llm_action = now
                     await self._handle_state(state, perception)
@@ -520,60 +546,162 @@ class AgentController:
             await self._act_explore(frame_b64, perception, ctx)
 
     def _act_follow(self, perception) -> None:
-        """Follow a player based on their detected position.
+        """Follow a player using spatial memory + current perception.
 
-        Uses the player's screen position to determine movement:
-        - Player left of center → turn left
-        - Player right of center → turn right
-        - Player small (far away) → move forward
-        - Player large (close) → stop, we're near them
+        If the player is currently visible, use their position.
+        If not visible but was recently seen, use spatial memory.
+        If lost entirely, stop and wait.
         """
-        if perception.players_visible == 0:
-            logger.info("[FOLLOWING] Lost sight of player, stopping")
-            self.move_tool.move(direction="stop")
-            return
-
-        px, py = perception.player_positions[0]
         self.scene_analyzer.agent_is_moving = True
 
-        if px < 0.35:
-            logger.info(f"[FOLLOWING] Player at left ({px:.2f}), turning left")
-            self.look_tool.turn(direction="left", amount="slight")
-        elif px > 0.65:
-            logger.info(f"[FOLLOWING] Player at right ({px:.2f}), turning right")
-            self.look_tool.turn(direction="right", amount="slight")
-        elif py < 0.5:
-            logger.info(f"[FOLLOWING] Player ahead but far ({py:.2f}), moving forward")
-            self.move_tool.move(direction="forward", speed=0.8, duration=1.0)
+        # Prefer current sighting
+        if perception.players_visible > 0:
+            px, py = perception.player_positions[0]
+            self.spatial_memory.add_player_sighting(px, py)
+
+            if px < 0.35:
+                logger.info(f"[FOLLOWING] Player left ({px:.2f}), turning")
+                self.look_tool.turn(direction="left", amount="slight")
+            elif px > 0.65:
+                logger.info(f"[FOLLOWING] Player right ({px:.2f}), turning")
+                self.look_tool.turn(direction="right", amount="slight")
+            elif py < 0.5:
+                logger.info(f"[FOLLOWING] Player far, moving forward")
+                self.move_tool.move(direction="forward", speed=0.8, duration=1.0)
+            else:
+                logger.info(f"[FOLLOWING] Close, keeping pace")
+                self.move_tool.move(direction="forward", speed=0.4, duration=0.5)
         else:
-            logger.info(f"[FOLLOWING] Player close and centered, keeping pace")
-            self.move_tool.move(direction="forward", speed=0.4, duration=0.5)
+            # Player not visible — check spatial memory
+            direction = self.spatial_memory.get_approach_direction()
+            if direction == "left":
+                logger.info("[FOLLOWING] Lost sight, turning left to search")
+                self.look_tool.turn(direction="left", amount="quarter")
+            elif direction == "right":
+                logger.info("[FOLLOWING] Lost sight, turning right to search")
+                self.look_tool.turn(direction="right", amount="quarter")
+            else:
+                logger.info("[FOLLOWING] No recent sighting, stopping")
+                self.move_tool.move(direction="stop")
 
         self.scene_analyzer.agent_is_moving = False
 
     async def _handle_conversation(self, speech: str, perception) -> None:
-        """Handle a speech interaction — highest priority."""
-        frame_b64 = self.video_capture.get_latest_frame_b64()
+        """Handle a speech interaction via 3-tier routing.
+
+        Tier 1: Instant intent matcher (regex, <1ms)
+        Tier 2: Fast text model Qwen 3.5 (~400ms)
+        Tier 3: Vision model Gemma 4 E2B (3-10s)
+        """
         ctx = self.state_machine.ctx
         ctx.conversation_turns += 1
         self._last_llm_action = time.time()
 
-        # Check if entering/exiting follow mode
-        state = self.state_machine.ctx.state
-        if state == AgentState.FOLLOWING:
-            logger.info("[FOLLOWING] Acknowledged! Following player.")
-            self.chatbox_tool.send_chatbox("Sure, I'll follow you!")
-            return
-        lower = speech.lower()
-        if any(p in lower for p in ["stop following", "stay here", "wait here"]):
-            logger.info("[FOLLOWING] Stop command received.")
-            self.chatbox_tool.send_chatbox("Okay, I'll stay here!")
+        # Record sound direction in spatial memory (for approach tool)
+        if hasattr(speech, "get"):
+            speech_text = speech.get("text", "")
+            direction = speech.get("direction", 0.0)
+        else:
+            speech_text = speech
+            direction = 0.0
+        if speech_text:
+            self.spatial_memory.add_sound_event(speech_text, direction, 1.0)
+
+        # --- TIER 1: Instant intent matcher ---
+        intent = match_intent(speech_text)
+        if intent:
+            logger.info(f"[TIER 1] Intent: {intent['intent']}")
+            await self._execute_intent(intent)
             return
 
-        # Stop moving to listen
+        # Stop moving to listen for other tiers
         self.move_tool.move(direction="stop")
 
-        logger.info(f'[CONVERSING] Responding to: "{speech}"')
+        # --- Decide: Tier 2 (text-only) vs Tier 3 (vision) ---
+        use_vision = needs_vision(speech_text) or not self.fast_model.is_available()
+
+        if not use_vision and self.fast_model.is_available():
+            # --- TIER 2: Fast text-only model ---
+            logger.info(f'[TIER 2] Qwen: "{speech_text}"')
+            await self._tier2_respond(speech_text, perception, ctx)
+        else:
+            # --- TIER 3: Gemma 4 vision model ---
+            logger.info(f'[TIER 3] Gemma 4: "{speech_text}"')
+            await self._tier3_respond(speech_text, perception, ctx)
+
+    async def _execute_intent(self, intent: dict) -> None:
+        """Execute a matched intent directly without LLM."""
+        # Handle state changes
+        state_change = intent.get("state_change")
+        if state_change == "FOLLOWING":
+            self.state_machine._transition_to(AgentState.FOLLOWING)
+        elif state_change == "SOCIALIZING":
+            self.state_machine._transition_to(AgentState.SOCIALIZING)
+
+        # Execute each tool call
+        for tc in intent["tool_calls"]:
+            handler = self._tool_handlers.get(tc["name"])
+            if not handler:
+                logger.warning(f"Unknown tool in intent: {tc['name']}")
+                continue
+            try:
+                self.state_machine.ctx.add_action(
+                    f"{tc['name']}({json.dumps(tc['args'], ensure_ascii=False)})"
+                )
+                if tc["args"]:
+                    handler(**tc["args"])
+                else:
+                    handler()
+            except Exception as e:
+                logger.error(f"Intent tool failed {tc['name']}: {e}")
+
+    async def _tier2_respond(self, speech: str, perception, ctx) -> None:
+        """Fast text-only response via Qwen 3.5."""
+        perception_text = perception.for_prompt() if perception else ""
+        spatial_text = self.spatial_memory.describe_context()
+
+        # Use the full personality prompt (no image, so no vision context needed)
+        system_prompt = build_system_prompt(
+            personality=self._personality,
+            tools=self._tool_schemas,
+            environment_summary=perception_text,
+            memory_context=self._get_memory_context(),
+        )
+
+        user_msg = (
+            f'Someone said: "{speech}"\n\n'
+            f"{spatial_text}\n\n"
+            "React like a real person. One send_chatbox message. "
+            "Gesture if it fits."
+            + ctx.recent_actions_text()
+            + ctx.recent_chatbox_text()
+        )
+
+        t_start = time.time()
+        result = self.fast_model.respond(
+            system_prompt=system_prompt,
+            user_message=user_msg,
+            tools=self._tool_definitions,
+            max_tokens=256,
+        )
+        elapsed = time.time() - t_start
+        logger.info(f"[TIER 2] Response in {elapsed:.1f}s")
+
+        # Execute returned tool calls
+        if result.get("tool_calls"):
+            for tc in result["tool_calls"]:
+                await self._execute_tool_call(tc)
+
+        # If only text content, send as chatbox
+        content = result.get("content", "").strip()
+        if content and not result.get("tool_calls"):
+            self.chatbox_tool.send_chatbox(content[:144])
+
+    async def _tier3_respond(self, speech: str, perception, ctx) -> None:
+        """Vision-based response via Gemma 4 E2B."""
+        frame_b64 = self.video_capture.get_latest_frame_b64()
+        perception_text = perception.for_prompt() if perception else ""
+        spatial_text = self.spatial_memory.describe_context()
 
         content_parts = []
         if frame_b64:
@@ -582,16 +710,14 @@ class AgentController:
                 "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"},
             })
 
-        # Include perception data for context
-        perception_text = perception.for_prompt() if perception else ""
-
         content_parts.append({
             "type": "text",
             "text": (
                 f'Someone said: "{speech}"\n\n'
-                f"{perception_text}\n\n"
+                f"{perception_text}\n"
+                f"{spatial_text}\n\n"
                 "React like a real person. One send_chatbox message. "
-                "Gesture if it fits the moment."
+                "Gesture if it fits."
                 + ctx.recent_actions_text()
                 + ctx.recent_chatbox_text()
             ),

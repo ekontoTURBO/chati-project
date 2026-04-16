@@ -23,7 +23,7 @@ logger = logging.getLogger("mcp.speak")
 MODELS_DIR = Path(__file__).parent.parent / "models" / "piper"
 
 # Default voice model — English US, medium quality, good speed/quality balance
-DEFAULT_MODEL = "en_US-lessac-medium.onnx"
+DEFAULT_MODEL = "en_US-amy-medium.onnx"
 
 
 class SpeakTool:
