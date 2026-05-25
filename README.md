@@ -1,5 +1,12 @@
 # Chati — VRChat AI Companion
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![GPU: RTX 3090](https://img.shields.io/badge/GPU-RTX%203090-76b900.svg)]()
+[![Gemma 4](https://img.shields.io/badge/Gemma%204-E4B-4285F4.svg)](https://ai.google.dev/gemma)
+[![VRChat: OSC](https://img.shields.io/badge/VRChat-OSC-08c.svg)](https://docs.vrchat.com/docs/osc-overview)
+[![Whisper](https://img.shields.io/badge/Whisper-faster--whisper-orange.svg)](https://github.com/SYSTRAN/faster-whisper)
+
 A local, real-time AI companion for VRChat. Sees, hears, speaks, moves, and remembers — all on a single RTX 3090.
 
 Chati is **not an AI assistant** and doesn't pretend to be one. The personality is "something older than human, not an AI — bound inside VRChat." Quietly curious, a little wistful, sometimes wry. It watches, joins in when it wants to, and remembers what you've told it.
